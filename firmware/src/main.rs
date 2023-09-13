@@ -8,20 +8,34 @@ use embassy_executor::_export::StaticCell;
 use embassy_executor::{Executor, Spawner};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Ipv4Address, Stack, StackResources};
+use embassy_sync::channel;
 use embassy_time::{Duration, Timer};
+use embedded_hal_async::spi::SpiBus;
 use embedded_svc::wifi::Configuration;
 use esp_backtrace as _;
 use esp_println::println;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiMode, WifiState};
 use esp_wifi::EspWifiInitFor;
 use hal::adc::{AdcCalLine, AdcConfig, AdcPin, Attenuation, ADC, ADC1};
-use hal::gpio::{Analog, GpioPin};
+use hal::clock::Clocks;
+use hal::dma::DmaPriority;
+use hal::gdma::{self, Gdma};
+use hal::gpio::{Analog, GpioPin, Unknown};
+use hal::spi::{FullDuplexMode, SpiMode};
+use hal::system::PeripheralClockControl;
 use hal::systimer::SystemTimer;
 use hal::{clock::ClockControl, peripherals::Peripherals, timer::TimerGroup, Rtc};
 use hal::{prelude::*, Rng, IO};
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+
+type Channel<T> =
+    channel::Channel<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
+type Receiver<T> =
+    channel::Receiver<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
+type Sender<T> =
+    channel::Sender<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
 
 struct Sensor<const P: u8> {
     adc: ADC<'static, ADC1>,
@@ -67,6 +81,66 @@ impl core::fmt::Write for Writer {
     }
 }
 
+macro_rules! singleton {
+    ($val:expr) => {{
+        type T = impl Sized;
+        static STATIC_CELL: StaticCell<T> = StaticCell::new();
+        let (x,) = STATIC_CELL.init(($val,));
+        x
+    }};
+}
+
+struct Led {
+    spi: hal::spi::dma::SpiDma<'static, hal::peripherals::SPI2, gdma::Channel0, FullDuplexMode>,
+    buf: [u8; 48],
+}
+
+impl Led {
+    fn new(
+        dma: hal::peripherals::DMA,
+        spi: hal::peripherals::SPI2,
+        pin: GpioPin<Unknown, 7>,
+        clocks: &Clocks,
+        cc: &mut PeripheralClockControl,
+    ) -> Self {
+        let descriptors = singleton!([0u32; 8 * 3]);
+        hal::interrupt::enable(
+            hal::peripherals::Interrupt::DMA_CH0,
+            hal::interrupt::Priority::Priority1,
+        )
+        .unwrap();
+
+        let dma = Gdma::new(dma, cc);
+        let dma_channel =
+            dma.channel0
+                .configure(false, descriptors, &mut [], DmaPriority::Priority0);
+
+        let spi = hal::spi::Spi::new_mosi_only(spi, pin, 3333u32.kHz(), SpiMode::Mode0, cc, clocks)
+            .with_dma(dma_channel);
+        Self { spi, buf: [0; 48] }
+    }
+
+    async fn color(&mut self, r: u8, g: u8, b: u8) {
+        self.write_color(r, g, b);
+        let _ = SpiBus::write(&mut self.spi, &self.buf).await;
+    }
+
+    fn write_color(&mut self, r: u8, g: u8, b: u8) {
+        Self::write_byte(&mut self.buf[0..4], g);
+        Self::write_byte(&mut self.buf[4..8], r);
+        Self::write_byte(&mut self.buf[8..12], b);
+    }
+
+    fn write_byte(buf: &mut [u8], mut b: u8) {
+        let patterns = [0b1000_1000, 0b1000_1110, 0b1110_1000, 0b1110_1110];
+        for out in buf {
+            let bits = (b & 0b1100_0000) >> 6;
+            *out = patterns[bits as usize];
+            b <<= 2;
+        }
+    }
+}
+
 impl<const P: u8> Sensor<P>
 where
     GpioPin<Analog, P>: embedded_hal::adc::Channel<ADC1, ID = u8>,
@@ -81,15 +155,6 @@ where
         println!("{}.{}°C", temp / 10, temp % 10);
         temp
     }
-}
-
-macro_rules! singleton {
-    ($val:expr) => {{
-        type T = impl Sized;
-        static STATIC_CELL: StaticCell<T> = StaticCell::new();
-        let (x,) = STATIC_CELL.init(($val,));
-        x
-    }};
 }
 
 #[entry]
@@ -162,14 +227,35 @@ fn main() -> ! {
         1234,
     ));
 
+    let led = Led::new(
+        peripherals.DMA,
+        peripherals.SPI2,
+        io.pins.gpio7,
+        &clocks,
+        &mut system.peripheral_clock_control,
+    );
+
+    let led_channel = singleton!(Channel::new());
+
     let executor = singleton!(Executor::new());
     executor.run(|spawner| {
-        spawner
-            .spawn(main_task(spawner, stack, controller, sensor))
-            .unwrap();
+        spawner.must_spawn(main_task(
+            spawner,
+            stack,
+            controller,
+            sensor,
+            led_channel.sender(),
+        ));
+        spawner.must_spawn(led_task(led, led_channel.receiver()));
     });
 
-    unreachable!();
+    // The unreachable!() shuts up a rust-analyzer warning (because ra doesn't
+    // realize that executor.run diverges), and the `allow` shuts up a rustc warning
+    // (because it does realize the executor.run diverges).
+    #[allow(unreachable_code)]
+    {
+        unreachable!();
+    }
 }
 
 #[embassy_executor::task]
@@ -178,10 +264,11 @@ async fn main_task(
     stack: &'static Stack<WifiDevice<'static>>,
     controller: WifiController<'static>,
     sensor: Sensor<3>,
+    led_sender: Sender<LedState>,
 ) {
     spawner.spawn(connection(controller)).unwrap();
     spawner.spawn(net_task(stack)).unwrap();
-    spawner.spawn(task(stack, sensor)).unwrap();
+    spawner.spawn(task(stack, sensor, led_sender)).unwrap();
 }
 
 #[embassy_executor::task]
@@ -220,10 +307,15 @@ async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
 }
 
 #[embassy_executor::task]
-async fn task(stack: &'static Stack<WifiDevice<'static>>, mut sensor: Sensor<3>) {
+async fn task(
+    stack: &'static Stack<WifiDevice<'static>>,
+    mut sensor: Sensor<3>,
+    led: Sender<LedState>,
+) {
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
 
+    let _ = led.try_send(LedState::WaitingForNetwork);
     loop {
         if stack.is_link_up() {
             break;
@@ -241,6 +333,7 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>, mut sensor: Sensor<3>)
         }
         Timer::after(Duration::from_millis(500)).await;
     }
+    let _ = led.try_send(LedState::Idle);
 
     let mut write = Writer::default();
     let mut req = Writer::default();
@@ -253,6 +346,12 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>, mut sensor: Sensor<3>)
     let remote_endpoint = (Ipv4Address::new(192, 168, 86, 118), 3000);
 
     loop {
+        let mut temp = 0;
+        for _ in 0..10 {
+            Timer::after(Duration::from_millis(1000)).await;
+            temp += sensor.read();
+        }
+
         println!("connecting...");
         let r = socket.connect(remote_endpoint).await;
         if let Err(e) = r {
@@ -261,13 +360,15 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>, mut sensor: Sensor<3>)
         }
         println!("connected!");
 
+        let _ = led.try_send(LedState::Sending);
+
         write.clear();
         req.clear();
-        let temp = sensor.read();
         write!(
             &mut write,
-            "{{ \"sensor_id\": 1, \"temperature\": {} }}",
-            temp
+            "{{ \"sensor_id\": 1, \"temperature\": {}.{:02} }}",
+            temp / 100,
+            temp % 100
         )
         .unwrap();
 
@@ -301,6 +402,26 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>, mut sensor: Sensor<3>)
         };
         println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
         socket.close();
-        Timer::after(Duration::from_millis(5000)).await;
+        let _ = led.try_send(LedState::Idle);
+    }
+}
+
+enum LedState {
+    WaitingForNetwork,
+    Idle,
+    Sending,
+}
+
+#[embassy_executor::task]
+async fn led_task(mut led: Led, state: Receiver<LedState>) {
+    led.color(0, 0, 0).await;
+    loop {
+        let state = state.recv().await;
+
+        match state {
+            LedState::WaitingForNetwork => led.color(8, 0, 0).await,
+            LedState::Idle => led.color(0, 0, 0).await,
+            LedState::Sending => led.color(0, 0, 2).await,
+        }
     }
 }

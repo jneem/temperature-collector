@@ -42,7 +42,7 @@ impl AppState {
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct TemperatureSubmission {
     sensor_id: i32,
-    temperature: i32,
+    temperature: f32,
 }
 
 mod embedded {
