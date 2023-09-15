@@ -43,6 +43,7 @@ impl AppState {
 pub struct TemperatureSubmission {
     sensor_id: i32,
     temperature: f32,
+    battery: Option<i32>,
 }
 
 mod embedded {
@@ -65,8 +66,8 @@ async fn collect(
         .get()
         .await?
         .query(
-            "INSERT INTO temperatures (sensor_id, timestamp, temperature) VALUES ($1, $2, $3);",
-            &[&submission.sensor_id, &time, &submission.temperature],
+            "INSERT INTO temperatures (sensor_id, timestamp, temperature, battery) VALUES ($1, $2, $3, $4);",
+            &[&submission.sensor_id, &time, &submission.temperature, &submission.battery],
         )
         .await?;
 

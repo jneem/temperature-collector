@@ -20,7 +20,7 @@ use hal::adc::{AdcCalLine, AdcConfig, AdcPin, Attenuation, ADC, ADC1};
 use hal::clock::Clocks;
 use hal::dma::DmaPriority;
 use hal::gdma::{self, Gdma};
-use hal::gpio::{Analog, GpioPin, Unknown};
+use hal::gpio::{Analog, GpioPin, Output, PushPull, Unknown};
 use hal::spi::{FullDuplexMode, SpiMode};
 use hal::system::PeripheralClockControl;
 use hal::systimer::SystemTimer;
@@ -29,6 +29,7 @@ use hal::{prelude::*, Rng, IO};
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+const SENSOR_ID: &str = env!("SENSOR_ID");
 
 type Channel<T> =
     channel::Channel<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
@@ -37,10 +38,9 @@ type Receiver<T> =
 type Sender<T> =
     channel::Sender<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
 
-struct Sensor<const P: u8> {
-    adc: ADC<'static, ADC1>,
-    pin: AdcPin<GpioPin<Analog, P>, ADC1, AdcCalLine<ADC1>>,
+struct SensorPin<const P: u8> {
     atten: Attenuation,
+    pin: AdcPin<GpioPin<Analog, P>, ADC1, AdcCalLine<ADC1>>,
 }
 
 struct Writer {
@@ -141,19 +141,69 @@ impl Led {
     }
 }
 
-impl<const P: u8> Sensor<P>
+async fn read_raw<const P: u8>(
+    adc: &mut ADC<'_, ADC1>,
+    pin: &mut AdcPin<GpioPin<Analog, P>, ADC1, AdcCalLine<ADC1>>,
+) -> u16
 where
     GpioPin<Analog, P>: embedded_hal::adc::Channel<ADC1, ID = u8>,
 {
-    fn read(&mut self) -> i16 {
-        // TODO: remove the block
-        let pin_value: u16 = nb::block!(self.adc.read(&mut self.pin)).unwrap();
-        println!("read {}", pin_value);
-        let mv = (pin_value as i32 * self.atten.ref_mv() as i32 / 4096) as i16;
-        println!("mV {}", mv);
-        let temp = mv - 500;
-        println!("{}.{}°C", temp / 10, temp % 10);
-        temp
+    loop {
+        let pin_value: nb::Result<u16, _> = adc.read(pin);
+        if let Ok(val) = pin_value {
+            println!("read {}", val);
+            return val;
+        } else {
+            // adc.read never returns an error other than WouldBlock, so we
+            // can assume it's WouldBlock here.
+            Timer::after(Duration::from_micros(50)).await;
+        }
+    }
+}
+
+async fn read_uv<const P: u8>(adc: &mut ADC<'_, ADC1>, pin: &mut SensorPin<P>) -> i32
+where
+    GpioPin<Analog, P>: embedded_hal::adc::Channel<ADC1, ID = u8>,
+{
+    let mut total = read_raw(adc, &mut pin.pin).await;
+    let mut max = total;
+    let mut min = total;
+    for _ in 0..9 {
+        let reading = read_raw(adc, &mut pin.pin).await;
+        max = max.max(reading);
+        min = min.min(reading);
+        total += reading;
+    }
+
+    total -= min;
+    total -= max;
+    total as i32 * pin.atten.ref_mv() as i32 / 1024 * 1000 / 4 / 8
+}
+
+struct Sensors {
+    adc: ADC<'static, ADC1>,
+    battery: SensorPin<1>,
+    battery_activate: GpioPin<Output<PushPull>, 0>,
+    temperature: SensorPin<3>,
+}
+
+impl Sensors {
+    /// Reads the current temperature in milli-degrees
+    async fn read_temperature(&mut self) -> i32 {
+        let uv = read_uv(&mut self.adc, &mut self.temperature).await;
+        println!("temp {} uV", uv);
+        (uv - 500_000) / 10
+    }
+
+    /// Returns the current battery voltage, in millivolts.
+    async fn read_battery(&mut self) -> i32 {
+        let _ = self.battery_activate.set_high();
+        Timer::after(Duration::from_millis(5)).await;
+        let uv = read_uv(&mut self.adc, &mut self.battery).await;
+        let _ = self.battery_activate.set_low();
+        println!("batt {} uV", uv);
+        // There's a 10k and a 68k resistor involved, so we need to rescale the voltage back. TODO: explain better
+        uv * 78 / 10 / 1000
     }
 }
 
@@ -187,18 +237,28 @@ fn main() -> ! {
     let analog = peripherals.APB_SARADC.split();
     let atten = Attenuation::Attenuation2p5dB;
     let mut adc1_config = AdcConfig::new();
-    let pin =
-        adc1_config.enable_pin_with_cal::<_, AdcCalLine<ADC1>>(io.pins.gpio3.into_analog(), atten);
+    let temp_pin = SensorPin {
+        pin: adc1_config
+            .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(io.pins.gpio3.into_analog(), atten),
+        atten,
+    };
+    let battery_pin = SensorPin {
+        pin: adc1_config
+            .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(io.pins.gpio1.into_analog(), atten),
+        atten,
+    };
+    let battery_activate = io.pins.gpio0.into_push_pull_output();
     let adc1: ADC<'static, ADC1> = ADC::<ADC1>::adc(
         &mut system.peripheral_clock_control,
         analog.adc1,
         adc1_config,
     )
     .unwrap();
-    let sensor = Sensor {
+    let sensors = Sensors {
+        temperature: temp_pin,
+        battery: battery_pin,
+        battery_activate,
         adc: adc1,
-        pin,
-        atten,
     };
 
     let timer = SystemTimer::new(peripherals.SYSTIMER).alarm0;
@@ -243,7 +303,7 @@ fn main() -> ! {
             spawner,
             stack,
             controller,
-            sensor,
+            sensors,
             led_channel.sender(),
         ));
         spawner.must_spawn(led_task(led, led_channel.receiver()));
@@ -263,12 +323,12 @@ async fn main_task(
     spawner: Spawner,
     stack: &'static Stack<WifiDevice<'static>>,
     controller: WifiController<'static>,
-    sensor: Sensor<3>,
+    sensors: Sensors,
     led_sender: Sender<LedState>,
 ) {
     spawner.spawn(connection(controller)).unwrap();
     spawner.spawn(net_task(stack)).unwrap();
-    spawner.spawn(task(stack, sensor, led_sender)).unwrap();
+    spawner.spawn(task(stack, sensors, led_sender)).unwrap();
 }
 
 #[embassy_executor::task]
@@ -293,8 +353,8 @@ async fn connection(mut controller: WifiController<'static>) {
 
         match controller.connect().await {
             Ok(_) => println!("Wifi connected!"),
-            Err(_e) => {
-                println!("Failed to connect to wifi");
+            Err(e) => {
+                println!("Failed to connect to wifi: {:?}", e);
                 Timer::after(Duration::from_millis(5000)).await
             }
         }
@@ -309,7 +369,7 @@ async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
 #[embassy_executor::task]
 async fn task(
     stack: &'static Stack<WifiDevice<'static>>,
-    mut sensor: Sensor<3>,
+    mut sensors: Sensors,
     led: Sender<LedState>,
 ) {
     let mut rx_buffer = [0; 4096];
@@ -346,11 +406,8 @@ async fn task(
     let remote_endpoint = (Ipv4Address::new(192, 168, 86, 118), 3000);
 
     loop {
-        let mut temp = 0;
-        for _ in 0..10 {
-            Timer::after(Duration::from_millis(1000)).await;
-            temp += sensor.read();
-        }
+        let battery = sensors.read_battery().await;
+        let temp = sensors.read_temperature().await;
 
         println!("connecting...");
         let r = socket.connect(remote_endpoint).await;
@@ -364,11 +421,14 @@ async fn task(
 
         write.clear();
         req.clear();
+        // FIXME: this is wrong for negative temperatures
         write!(
             &mut write,
-            "{{ \"sensor_id\": 1, \"temperature\": {}.{:02} }}",
-            temp / 100,
-            temp % 100
+            "{{ \"sensor_id\": {}, \"temperature\": {}.{:04}, \"battery\": {} }}",
+            SENSOR_ID,
+            temp / 1_000,
+            temp % 1_000,
+            battery
         )
         .unwrap();
 
@@ -403,6 +463,7 @@ async fn task(
         println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
         socket.close();
         let _ = led.try_send(LedState::Idle);
+        Timer::after(Duration::from_secs(5)).await;
     }
 }
 
