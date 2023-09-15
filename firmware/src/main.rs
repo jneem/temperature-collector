@@ -191,7 +191,7 @@ impl Sensors {
     /// Reads the current temperature in milli-degrees
     async fn read_temperature(&mut self) -> i32 {
         let uv = read_uv(&mut self.adc, &mut self.temperature).await;
-        println!("temp {} uV", uv);
+        println!("temp {} uV", (uv - 500_000) / 10);
         (uv - 500_000) / 10
     }
 
@@ -409,13 +409,13 @@ async fn task(
         let battery = sensors.read_battery().await;
         let temp = sensors.read_temperature().await;
 
-        println!("connecting...");
         let r = socket.connect(remote_endpoint).await;
         if let Err(e) = r {
+            // FIXME: this error (and the ones below it) put us in a busy loop
+            // if the server's gone down
             println!("connect error: {:?}", e);
             continue;
         }
-        println!("connected!");
 
         let _ = led.try_send(LedState::Sending);
 
@@ -424,7 +424,7 @@ async fn task(
         // FIXME: this is wrong for negative temperatures
         write!(
             &mut write,
-            "{{ \"sensor_id\": {}, \"temperature\": {}.{:04}, \"battery\": {} }}",
+            "{{ \"sensor_id\": {}, \"temperature\": {}.{:03}, \"battery\": {} }}",
             SENSOR_ID,
             temp / 1_000,
             temp % 1_000,
@@ -445,6 +445,7 @@ async fn task(
         let r = socket.write_all(req.as_str().as_bytes()).await;
         if let Err(e) = r {
             println!("write error: {:?}", e);
+            // FIXME: this aborts. Try to recover instead
             break;
         }
 
