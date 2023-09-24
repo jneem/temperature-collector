@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::SystemTime};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use clap::Parser;
@@ -44,6 +48,7 @@ pub struct TemperatureSubmission {
     sensor_id: i32,
     temperature: f32,
     battery: Option<i32>,
+    ms_ago: Option<u32>,
 }
 
 mod embedded {
@@ -51,15 +56,14 @@ mod embedded {
     embed_migrations!("migrations");
 }
 
-// TODO: an endpoint for "registering" sensor for the first time, ensuring a unique id and providing a description
-
 #[axum_macros::debug_handler]
 async fn collect(
     State(state): State<AppState>,
     Json(submission): Json<TemperatureSubmission>,
 ) -> Result<(), Error> {
     tracing::info!("got {submission:?}");
-    let time = SystemTime::now();
+    let time =
+        SystemTime::now() - Duration::from_millis(submission.ms_ago.unwrap_or_default().into());
 
     state
         .inner
