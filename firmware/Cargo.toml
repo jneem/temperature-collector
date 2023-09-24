@@ -22,6 +22,11 @@ esp-println = { version = "0.6.0", features = ["esp32c3"] }
 esp-backtrace = { version = "0.8.0", features = ["esp32c3", "print-uart", "panic-handler"] }
 embedded-hal = "0.2.7"
 embedded-hal-async = "1.0.0-rc.1"
+arrayvec = { version = "0.7.4", default-features = false }
 
 [profile.dev]
 opt-level = 2
+
+[patch.crates-io]
+esp32c3-hal = { git = "https://github.com/jneem/esp-hal", branch = "sleep" }
+esp-hal-common = { git = "https://github.com/jneem/esp-hal", branch = "sleep" }

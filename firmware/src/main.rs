@@ -4,6 +4,7 @@
 
 use core::fmt::Write;
 
+use arrayvec::ArrayVec;
 use embassy_executor::_export::StaticCell;
 use embassy_executor::{Executor, Spawner};
 use embassy_net::tcp::TcpSocket;
@@ -11,16 +12,17 @@ use embassy_net::{Ipv4Address, Stack, StackResources};
 use embassy_sync::channel;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::spi::SpiBus;
-use embedded_svc::wifi::Configuration;
+use embedded_svc::wifi::{Configuration, Wifi};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiMode, WifiState};
+use esp_wifi::wifi::{WifiDevice, WifiMode};
 use esp_wifi::EspWifiInitFor;
 use hal::adc::{AdcCalLine, AdcConfig, AdcPin, Attenuation, ADC, ADC1};
-use hal::clock::Clocks;
+use hal::clock::{Clocks, CpuClock};
 use hal::dma::DmaPriority;
 use hal::gdma::{self, Gdma};
 use hal::gpio::{Analog, GpioPin, Output, PushPull, Unknown};
+use hal::rtc_cntl::sleep::TimerWakeupSource;
 use hal::spi::{FullDuplexMode, SpiMode};
 use hal::system::PeripheralClockControl;
 use hal::systimer::SystemTimer;
@@ -30,13 +32,42 @@ use hal::{prelude::*, Rng, IO};
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const SENSOR_ID: &str = env!("SENSOR_ID");
+const MS_PER_MEASUREMENT: u64 = 5_000;
 
 type Channel<T> =
     channel::Channel<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
 type Receiver<T> =
     channel::Receiver<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
-type Sender<T> =
-    channel::Sender<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
+
+type MeasurementBuffer = ArrayVec<Measurement, 5>;
+
+#[ram(rtc_fast, uninitialized)]
+static mut MEASUREMENT_BUFFER: MeasurementBuffer = ArrayVec::new_const();
+
+// A static bool, to put a safe API around MEASUREMENT_BUFFER.
+static INITED: StaticCell<()> = StaticCell::new();
+
+struct Measurement {
+    rtc_ms: u64,
+    temperature_millidegs: i32,
+    battery_millivolts: u32,
+}
+
+fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
+    // This will panic if it was already inited, making the following line safe
+    // because the mut reference will be unique.
+    INITED.init(());
+
+    let cause = hal::reset::get_wakeup_cause();
+    if !matches!(cause, hal::reset::SleepSource::Timer) {
+        println!("wakeup caused by {:?}, initializing measurements", cause);
+        unsafe {
+            MEASUREMENT_BUFFER = ArrayVec::new();
+        }
+    }
+
+    unsafe { &mut MEASUREMENT_BUFFER }
+}
 
 struct SensorPin<const P: u8> {
     atten: Attenuation,
@@ -82,11 +113,9 @@ impl core::fmt::Write for Writer {
 }
 
 macro_rules! singleton {
-    ($val:expr) => {{
-        type T = impl Sized;
-        static STATIC_CELL: StaticCell<T> = StaticCell::new();
-        let (x,) = STATIC_CELL.init(($val,));
-        x
+    ($val:expr, $typ:ty) => {{
+        static STATIC_CELL: StaticCell<$typ> = StaticCell::new();
+        STATIC_CELL.init($val)
     }};
 }
 
@@ -103,7 +132,7 @@ impl Led {
         clocks: &Clocks,
         cc: &mut PeripheralClockControl,
     ) -> Self {
-        let descriptors = singleton!([0u32; 8 * 3]);
+        let descriptors = singleton!([0u32; 8 * 3], [u32; 8 * 3]);
         hal::interrupt::enable(
             hal::peripherals::Interrupt::DMA_CH0,
             hal::interrupt::Priority::Priority1,
@@ -188,6 +217,35 @@ struct Sensors {
 }
 
 impl Sensors {
+    fn new(
+        adc: ADC1,
+        battery: GpioPin<Unknown, 1>,
+        battery_activate: GpioPin<Unknown, 0>,
+        temperature: GpioPin<Unknown, 3>,
+        pcc: &mut PeripheralClockControl,
+    ) -> Self {
+        let atten = Attenuation::Attenuation2p5dB;
+        let mut adc_config = AdcConfig::new();
+        let temp_pin = SensorPin {
+            pin: adc_config
+                .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(temperature.into_analog(), atten),
+            atten,
+        };
+        let battery_pin = SensorPin {
+            pin: adc_config
+                .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(battery.into_analog(), atten),
+            atten,
+        };
+        let battery_activate = battery_activate.into_push_pull_output();
+        let adc1: ADC<'static, ADC1> = ADC::<ADC1>::adc(pcc, adc, adc_config).unwrap();
+        Sensors {
+            temperature: temp_pin,
+            battery: battery_pin,
+            battery_activate,
+            adc: adc1,
+        }
+    }
+
     /// Reads the current temperature in milli-degrees
     async fn read_temperature(&mut self) -> i32 {
         let uv = read_uv(&mut self.adc, &mut self.temperature).await;
@@ -209,104 +267,16 @@ impl Sensors {
 
 #[entry]
 fn main() -> ! {
-    let peripherals = Peripherals::take();
-    let mut system = peripherals.SYSTEM.split();
-    let clocks = ClockControl::max(system.clock_control).freeze();
+    let executor = singleton!(Executor::new(), Executor);
+    let measurements = get_measurement_buffer();
+    println!("buffer has {} measurements", measurements.len());
 
-    // Disable the RTC and TIMG watchdog timers
-    let mut rtc = Rtc::new(peripherals.RTC_CNTL);
-    let timer_group0 = TimerGroup::new(
-        peripherals.TIMG0,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
-    let mut wdt0 = timer_group0.wdt;
-    let timer_group1 = TimerGroup::new(
-        peripherals.TIMG1,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
-    let mut wdt1 = timer_group1.wdt;
-
-    rtc.swd.disable();
-    rtc.rwdt.disable();
-    wdt0.disable();
-    wdt1.disable();
-
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let analog = peripherals.APB_SARADC.split();
-    let atten = Attenuation::Attenuation2p5dB;
-    let mut adc1_config = AdcConfig::new();
-    let temp_pin = SensorPin {
-        pin: adc1_config
-            .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(io.pins.gpio3.into_analog(), atten),
-        atten,
-    };
-    let battery_pin = SensorPin {
-        pin: adc1_config
-            .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(io.pins.gpio1.into_analog(), atten),
-        atten,
-    };
-    let battery_activate = io.pins.gpio0.into_push_pull_output();
-    let adc1: ADC<'static, ADC1> = ADC::<ADC1>::adc(
-        &mut system.peripheral_clock_control,
-        analog.adc1,
-        adc1_config,
-    )
-    .unwrap();
-    let sensors = Sensors {
-        temperature: temp_pin,
-        battery: battery_pin,
-        battery_activate,
-        adc: adc1,
-    };
-
-    let timer = SystemTimer::new(peripherals.SYSTIMER).alarm0;
-
-    let init = esp_wifi::initialize(
-        EspWifiInitFor::Wifi,
-        timer,
-        Rng::new(peripherals.RNG),
-        system.radio_clock_control,
-        &clocks,
-    )
-    .unwrap();
-
-    let wifi = peripherals.RADIO.split().0;
-    let (wifi_interface, controller) =
-        esp_wifi::wifi::new_with_mode(&init, wifi, WifiMode::Sta).unwrap();
-
-    hal::embassy::init(&clocks, timer_group0.timer0);
-
-    let dhcp_config = embassy_net::Config::dhcpv4(Default::default());
-    let stack_resources = singleton!(StackResources::<3>::new());
-    let stack = singleton!(Stack::new(
-        wifi_interface,
-        dhcp_config,
-        stack_resources,
-        1234,
-    ));
-
-    let led = Led::new(
-        peripherals.DMA,
-        peripherals.SPI2,
-        io.pins.gpio7,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
-
-    let led_channel = singleton!(Channel::new());
-
-    let executor = singleton!(Executor::new());
     executor.run(|spawner| {
-        spawner.must_spawn(main_task(
-            spawner,
-            stack,
-            controller,
-            sensors,
-            led_channel.sender(),
-        ));
-        spawner.must_spawn(led_task(led, led_channel.receiver()));
+        if measurements.is_full() {
+            spawner.must_spawn(transmit(spawner, measurements));
+        } else {
+            spawner.must_spawn(measure(measurements));
+        }
     });
 
     // The unreachable!() shuts up a rust-analyzer warning (because ra doesn't
@@ -319,71 +289,73 @@ fn main() -> ! {
 }
 
 #[embassy_executor::task]
-async fn main_task(
-    spawner: Spawner,
-    stack: &'static Stack<WifiDevice<'static>>,
-    controller: WifiController<'static>,
-    sensors: Sensors,
-    led_sender: Sender<LedState>,
-) {
-    spawner.spawn(connection(controller)).unwrap();
-    spawner.spawn(net_task(stack)).unwrap();
-    spawner.spawn(task(stack, sensors, led_sender)).unwrap();
-}
+async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer) {
+    let peripherals = Peripherals::take();
+    let mut system = peripherals.SYSTEM.split();
+    let clocks = ClockControl::max(system.clock_control).freeze();
+    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
 
-#[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
-    use embedded_svc::wifi::Wifi;
-    loop {
-        if matches!(esp_wifi::wifi::get_wifi_state(), WifiState::StaConnected) {
-            controller.wait_for_event(WifiEvent::StaDisconnected).await;
-            Timer::after(Duration::from_millis(1000)).await
-        }
-        if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = Configuration::Client(embedded_svc::wifi::ClientConfiguration {
-                ssid: SSID.into(),
-                password: PASSWORD.into(),
-                ..Default::default()
-            });
-            controller.set_configuration(&client_config).unwrap();
-            println!("Starting controller...");
-            controller.start().await.unwrap();
-        }
-        println!("Connecting...");
+    let mut rtc = Rtc::new(peripherals.RTC_CNTL);
 
-        match controller.connect().await {
-            Ok(_) => println!("Wifi connected!"),
-            Err(e) => {
-                println!("Failed to connect to wifi: {:?}", e);
-                Timer::after(Duration::from_millis(5000)).await
-            }
+    let timer_group0 = TimerGroup::new(
+        peripherals.TIMG0,
+        &clocks,
+        &mut system.peripheral_clock_control,
+    );
+    // FIXME: do I have to do this *before* spawning an async task?
+    // I think not, based on the embassy::main macro.
+    hal::embassy::init(&clocks, timer_group0.timer0);
+
+    let led = Led::new(
+        peripherals.DMA,
+        peripherals.SPI2,
+        io.pins.gpio7,
+        &clocks,
+        &mut system.peripheral_clock_control,
+    );
+
+    let led_channel = singleton!(Channel::new(), Channel<LedState>);
+
+    let timer = SystemTimer::new(peripherals.SYSTIMER).alarm0;
+    let init = esp_wifi::initialize(
+        EspWifiInitFor::Wifi,
+        timer,
+        Rng::new(peripherals.RNG),
+        system.radio_clock_control,
+        &clocks,
+    )
+    .unwrap();
+
+    let wifi = peripherals.RADIO.split().0;
+    let (wifi_interface, mut controller) =
+        esp_wifi::wifi::new_with_mode(&init, wifi, WifiMode::Sta).unwrap();
+    let stack_resources = singleton!(StackResources::new(), StackResources::<3>);
+    let dhcp_config = embassy_net::Config::dhcpv4(Default::default());
+    let stack = singleton!(
+        Stack::new(wifi_interface, dhcp_config, stack_resources, 1234,),
+        Stack<WifiDevice<'static>>
+    );
+
+    spawner.must_spawn(net_task(stack));
+    spawner.must_spawn(led_task(led, led_channel.receiver()));
+    led_channel.send(LedState::WaitingForNetwork).await;
+
+    let client_config = Configuration::Client(embedded_svc::wifi::ClientConfiguration {
+        ssid: SSID.into(),
+        password: PASSWORD.into(),
+        ..Default::default()
+    });
+    controller.set_configuration(&client_config).unwrap();
+    println!("Starting controller...");
+    controller.start().await.unwrap();
+
+    println!("Connecting...");
+    match controller.connect().await {
+        Ok(_) => println!("Wifi connected!"),
+        Err(e) => {
+            println!("Failed to connect to wifi: {:?}", e);
         }
     }
-}
-
-#[embassy_executor::task]
-async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
-    stack.run().await
-}
-
-#[embassy_executor::task]
-async fn task(
-    stack: &'static Stack<WifiDevice<'static>>,
-    mut sensors: Sensors,
-    led: Sender<LedState>,
-) {
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
-
-    let _ = led.try_send(LedState::WaitingForNetwork);
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
-        println!("not up yet...");
-        Timer::after(Duration::from_millis(500)).await;
-    }
-    println!("up!");
 
     println!("Waiting to get IP address...");
     loop {
@@ -393,42 +365,38 @@ async fn task(
         }
         Timer::after(Duration::from_millis(500)).await;
     }
-    let _ = led.try_send(LedState::Idle);
 
+    led_channel.send(LedState::Sending).await;
     let mut write = Writer::default();
     let mut req = Writer::default();
-    Timer::after(Duration::from_millis(1_000)).await;
-
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
 
     socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
     let remote_endpoint = (Ipv4Address::new(192, 168, 86, 118), 3000);
+    let r = socket.connect(remote_endpoint).await;
+    if let Err(e) = r {
+        println!("connect error: {:?}", e);
+    }
 
-    loop {
-        let battery = sensors.read_battery().await;
-        let temp = sensors.read_temperature().await;
-
-        let r = socket.connect(remote_endpoint).await;
-        if let Err(e) = r {
-            // FIXME: this error (and the ones below it) put us in a busy loop
-            // if the server's gone down
-            println!("connect error: {:?}", e);
-            continue;
-        }
-
-        let _ = led.try_send(LedState::Sending);
-
+    for meas in &*measurements {
         write.clear();
         req.clear();
+
+        let now = rtc.get_time_ms();
+        let ms_ago = now.saturating_sub(meas.rtc_ms);
+
         // FIXME: this is wrong for negative temperatures
         write!(
             &mut write,
-            "{{ \"sensor_id\": {}, \"temperature\": {}.{:03}, \"battery\": {} }}",
+            "{{ \"sensor_id\": {}, \"temperature\": {}.{:03}, \"battery\": {}, \"ms_ago\": {} }}",
             SENSOR_ID,
-            temp / 1_000,
-            temp % 1_000,
-            battery
+            meas.temperature_millidegs / 1_000,
+            meas.temperature_millidegs % 1_000,
+            meas.battery_millivolts,
+            ms_ago
         )
         .unwrap();
 
@@ -462,10 +430,84 @@ async fn task(
             }
         };
         println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
-        socket.close();
-        let _ = led.try_send(LedState::Idle);
-        Timer::after(Duration::from_secs(5)).await;
     }
+    measurements.clear();
+    socket.close();
+
+    led_channel.send(LedState::Idle).await;
+    Timer::after(Duration::from_millis(100)).await;
+    let rtc_now = rtc.get_time_ms();
+    let wakeup_time = rtc_now + MS_PER_MEASUREMENT;
+    let quantized_wakeup_time = wakeup_time - wakeup_time % MS_PER_MEASUREMENT;
+    let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(
+        quantized_wakeup_time.saturating_sub(rtc_now),
+    ));
+    let mut delay = hal::Delay::new(&clocks);
+    rtc.sleep_deep(&[&mut wake], &mut delay);
+}
+
+// TODO: can we make this an embassy_executor::main?
+#[embassy_executor::task]
+async fn measure(measurements: &'static mut MeasurementBuffer) {
+    let peripherals = Peripherals::take();
+    let mut system = peripherals.SYSTEM.split();
+    let clocks = ClockControl::configure(system.clock_control, CpuClock::Clock80MHz).freeze();
+
+    let mut rtc = Rtc::new(peripherals.RTC_CNTL);
+    let timer_group0 = TimerGroup::new(
+        peripherals.TIMG0,
+        &clocks,
+        &mut system.peripheral_clock_control,
+    );
+    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+    let analog = peripherals.APB_SARADC.split();
+    let mut sensors = Sensors::new(
+        analog.adc1,
+        io.pins.gpio1,
+        io.pins.gpio0,
+        io.pins.gpio3,
+        &mut system.peripheral_clock_control,
+    );
+
+    hal::embassy::init(&clocks, timer_group0.timer0);
+
+    let mut led = Led::new(
+        peripherals.DMA,
+        peripherals.SPI2,
+        io.pins.gpio7,
+        &clocks,
+        &mut system.peripheral_clock_control,
+    );
+    led.color(1, 1, 1).await;
+
+    let battery_millivolts = sensors.read_battery().await as u32;
+    let temperature_millidegs = sensors.read_temperature().await;
+    let rtc_ms = rtc.get_time_ms();
+    measurements.push(Measurement {
+        rtc_ms,
+        temperature_millidegs,
+        battery_millivolts,
+    });
+
+    led.color(0, 0, 0).await;
+    let sleep_ms = if measurements.is_full() {
+        0
+    } else {
+        let rtc_now = rtc.get_time_ms();
+        let wakeup_time = rtc_now + MS_PER_MEASUREMENT;
+        let quantized_wakeup_time = wakeup_time - wakeup_time % MS_PER_MEASUREMENT;
+        quantized_wakeup_time.saturating_sub(rtc_now)
+    };
+    println!(
+        "now is {}, planning to sleep for {} ms",
+        rtc.get_time_ms(),
+        sleep_ms
+    );
+    Timer::after(Duration::from_millis(100)).await;
+
+    let mut delay = hal::Delay::new(&clocks);
+    let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(sleep_ms));
+    rtc.sleep_deep(&[&mut wake], &mut delay);
 }
 
 enum LedState {
@@ -486,4 +528,9 @@ async fn led_task(mut led: Led, state: Receiver<LedState>) {
             LedState::Sending => led.color(0, 0, 2).await,
         }
     }
+}
+
+#[embassy_executor::task]
+async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
+    stack.run().await
 }
