@@ -15,7 +15,7 @@ use embedded_hal_async::spi::SpiBus;
 use embedded_svc::wifi::{Configuration, Wifi};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_wifi::wifi::{WifiDevice, WifiMode};
+use esp_wifi::wifi::{WifiController, WifiDevice, WifiError, WifiMode};
 use esp_wifi::EspWifiInitFor;
 use hal::adc::{AdcCalLine, AdcConfig, AdcPin, Attenuation, ADC, ADC1};
 use hal::clock::{Clocks, CpuClock};
@@ -32,14 +32,16 @@ use hal::{prelude::*, Rng, IO};
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const SENSOR_ID: &str = env!("SENSOR_ID");
-const MS_PER_MEASUREMENT: u64 = 5_000;
+const MS_PER_MEASUREMENT: u64 = 10_000;
 
 type Channel<T> =
     channel::Channel<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
 type Receiver<T> =
     channel::Receiver<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
+type Sender<T> =
+    channel::Sender<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
 
-type MeasurementBuffer = ArrayVec<Measurement, 5>;
+type MeasurementBuffer = ArrayVec<Measurement, 64>;
 
 #[ram(rtc_fast, uninitialized)]
 static mut MEASUREMENT_BUFFER: MeasurementBuffer = ArrayVec::new_const();
@@ -47,10 +49,11 @@ static mut MEASUREMENT_BUFFER: MeasurementBuffer = ArrayVec::new_const();
 // A static bool, to put a safe API around MEASUREMENT_BUFFER.
 static INITED: StaticCell<()> = StaticCell::new();
 
+// TODO: fixed point representations, and better units
 struct Measurement {
-    rtc_ms: u64,
     temperature_millidegs: i32,
     battery_millivolts: u32,
+    rtc_ms: u64,
 }
 
 fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
@@ -211,17 +214,17 @@ where
 
 struct Sensors {
     adc: ADC<'static, ADC1>,
-    battery: SensorPin<1>,
-    battery_activate: GpioPin<Output<PushPull>, 0>,
-    temperature: SensorPin<3>,
+    battery: SensorPin<3>,
+    battery_activate: GpioPin<Output<PushPull>, 2>,
+    temperature: SensorPin<4>,
 }
 
 impl Sensors {
     fn new(
         adc: ADC1,
-        battery: GpioPin<Unknown, 1>,
-        battery_activate: GpioPin<Unknown, 0>,
-        temperature: GpioPin<Unknown, 3>,
+        battery: GpioPin<Unknown, 3>,
+        battery_activate: GpioPin<Unknown, 2>,
+        temperature: GpioPin<Unknown, 4>,
         pcc: &mut PeripheralClockControl,
     ) -> Self {
         let atten = Attenuation::Attenuation2p5dB;
@@ -248,9 +251,16 @@ impl Sensors {
 
     /// Reads the current temperature in milli-degrees
     async fn read_temperature(&mut self) -> i32 {
-        let uv = read_uv(&mut self.adc, &mut self.temperature).await;
-        println!("temp {} uV", (uv - 500_000) / 10);
-        (uv - 500_000) / 10
+        let mut ret = 0;
+        const REPS: i32 = 16;
+
+        for _ in 0..REPS {
+            let uv = read_uv(&mut self.adc, &mut self.temperature).await;
+            println!("temp {} uV", (uv - 500_000) / 10);
+            ret += (uv - 500_000) / 10;
+        }
+        ret /= REPS;
+        ret
     }
 
     /// Returns the current battery voltage, in millivolts.
@@ -286,6 +296,44 @@ fn main() -> ! {
     {
         unreachable!();
     }
+}
+
+async fn connect(
+    mut controller: WifiController<'static>,
+    stack: &'static Stack<WifiDevice<'static>>,
+    led: Sender<LedState>,
+) -> Result<(), WifiError> {
+    let client_config = Configuration::Client(embedded_svc::wifi::ClientConfiguration {
+        ssid: SSID.into(),
+        password: PASSWORD.into(),
+        ..Default::default()
+    });
+    controller.set_configuration(&client_config)?;
+    println!("Starting controller...");
+    led.send(LedState::Other).await;
+    // TODO: add a timeout
+    controller.start().await?;
+
+    led.send(LedState::WaitingForNetwork).await;
+    println!("Connecting...");
+    // TODO: add a timeout
+    controller.connect().await?;
+
+    led.send(LedState::Other).await;
+    println!("Waiting to get IP address...");
+    for _ in 0..40 {
+        if let Some(config) = stack.config_v4() {
+            println!("Got IP: {}", config.address);
+            return Ok(());
+        }
+        led.send(LedState::WaitingForNetwork).await;
+        Timer::after(Duration::from_millis(250)).await;
+        led.send(LedState::Other).await;
+        Timer::after(Duration::from_millis(250)).await;
+    }
+
+    // TODO: better error
+    Err(WifiError::Disconnected)
 }
 
 #[embassy_executor::task]
@@ -327,7 +375,7 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     .unwrap();
 
     let wifi = peripherals.RADIO.split().0;
-    let (wifi_interface, mut controller) =
+    let (wifi_interface, controller) =
         esp_wifi::wifi::new_with_mode(&init, wifi, WifiMode::Sta).unwrap();
     let stack_resources = singleton!(StackResources::new(), StackResources::<3>);
     let dhcp_config = embassy_net::Config::dhcpv4(Default::default());
@@ -340,30 +388,15 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     spawner.must_spawn(led_task(led, led_channel.receiver()));
     led_channel.send(LedState::WaitingForNetwork).await;
 
-    let client_config = Configuration::Client(embedded_svc::wifi::ClientConfiguration {
-        ssid: SSID.into(),
-        password: PASSWORD.into(),
-        ..Default::default()
-    });
-    controller.set_configuration(&client_config).unwrap();
-    println!("Starting controller...");
-    controller.start().await.unwrap();
-
-    println!("Connecting...");
-    match controller.connect().await {
-        Ok(_) => println!("Wifi connected!"),
-        Err(e) => {
-            println!("Failed to connect to wifi: {:?}", e);
-        }
-    }
-
-    println!("Waiting to get IP address...");
-    loop {
-        if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
+    if connect(controller, stack, led_channel.sender())
+        .await
+        .is_err()
+    {
+        led_channel.send(LedState::Idle).await;
+        Timer::after(Duration::from_millis(100)).await;
+        let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(100));
+        let mut delay = hal::Delay::new(&clocks);
+        rtc.sleep_deep(&[&mut wake], &mut delay);
     }
 
     led_channel.send(LedState::Sending).await;
@@ -371,17 +404,21 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     let mut req = Writer::default();
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
-    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
     let remote_endpoint = (Ipv4Address::new(192, 168, 86, 118), 3000);
-    let r = socket.connect(remote_endpoint).await;
-    if let Err(e) = r {
-        println!("connect error: {:?}", e);
-    }
 
-    for meas in &*measurements {
+    // TODO: This is super bizarre. On deep sleep, the rtc_ms field in the
+    // first measurement always gets zeroed. We fix it by always ignoring the
+    // first measurement. (Below this loop, we stick in a dummy first measurement
+    // so that we aren't actually skipping any data.)
+    for meas in measurements.iter().skip(1) {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+        let r = socket.connect(remote_endpoint).await;
+        if let Err(e) = r {
+            println!("connect error: {:?}", e);
+        }
+
         write.clear();
         req.clear();
 
@@ -418,21 +455,29 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
         }
 
         let mut buf = [0; 256];
-        let n = match socket.read(&mut buf).await {
-            Ok(0) => {
-                println!("read EOF");
-                break;
-            }
-            Ok(n) => n,
-            Err(e) => {
-                println!("read error: {:?}", e);
-                break;
-            }
-        };
-        println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
+        loop {
+            let n = match socket.read(&mut buf).await {
+                Ok(0) => {
+                    println!("read EOF");
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    println!("read error: {:?}", e);
+                    break;
+                }
+            };
+            println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
+        }
+
+        socket.close();
     }
     measurements.clear();
-    socket.close();
+    measurements.push(Measurement {
+        temperature_millidegs: 77,
+        battery_millivolts: 77,
+        rtc_ms: 77,
+    });
 
     led_channel.send(LedState::Idle).await;
     Timer::after(Duration::from_millis(100)).await;
@@ -463,9 +508,9 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
     let analog = peripherals.APB_SARADC.split();
     let mut sensors = Sensors::new(
         analog.adc1,
-        io.pins.gpio1,
-        io.pins.gpio0,
         io.pins.gpio3,
+        io.pins.gpio2,
+        io.pins.gpio4,
         &mut system.peripheral_clock_control,
     );
 
@@ -503,6 +548,11 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
         rtc.get_time_ms(),
         sleep_ms
     );
+    println!(
+        "buf has {} measurements, last time is {}",
+        measurements.len(),
+        measurements.last().unwrap().rtc_ms
+    );
     Timer::after(Duration::from_millis(100)).await;
 
     let mut delay = hal::Delay::new(&clocks);
@@ -514,6 +564,7 @@ enum LedState {
     WaitingForNetwork,
     Idle,
     Sending,
+    Other,
 }
 
 #[embassy_executor::task]
@@ -526,6 +577,7 @@ async fn led_task(mut led: Led, state: Receiver<LedState>) {
             LedState::WaitingForNetwork => led.color(8, 0, 0).await,
             LedState::Idle => led.color(0, 0, 0).await,
             LedState::Sending => led.color(0, 0, 2).await,
+            LedState::Other => led.color(0, 1, 2).await,
         }
     }
 }
