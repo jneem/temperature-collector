@@ -23,6 +23,7 @@ esp-backtrace = { version = "0.8.0", features = ["esp32c3", "print-uart", "panic
 embedded-hal = "0.2.7"
 embedded-hal-async = "1.0.0-rc.1"
 arrayvec = { version = "0.7.4", default-features = false }
+fixed = "1.24.0"
 
 [profile.dev]
 opt-level = 2

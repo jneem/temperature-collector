@@ -2,7 +2,7 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Write;
+use core::fmt::{Display, Write};
 
 use arrayvec::ArrayVec;
 use embassy_executor::_export::StaticCell;
@@ -17,6 +17,7 @@ use esp_backtrace as _;
 use esp_println::println;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiError, WifiMode};
 use esp_wifi::EspWifiInitFor;
+use fixed::types::I20F12;
 use hal::adc::{AdcCalLine, AdcConfig, AdcPin, Attenuation, ADC, ADC1};
 use hal::clock::{Clocks, CpuClock};
 use hal::dma::DmaPriority;
@@ -49,10 +50,33 @@ static mut MEASUREMENT_BUFFER: MeasurementBuffer = ArrayVec::new_const();
 // A static bool, to put a safe API around MEASUREMENT_BUFFER.
 static INITED: StaticCell<()> = StaticCell::new();
 
-// TODO: fixed point representations, and better units
+#[derive(Copy, Clone)]
+struct Voltage {
+    mv: I20F12,
+}
+
+impl Display for Voltage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} mV", self.mv)
+    }
+}
+
+#[derive(Copy, Clone, Default)]
+struct Temperature {
+    deg: I20F12,
+}
+
+impl Temperature {
+    fn from_tmp36_voltage(v: Voltage) -> Self {
+        Self {
+            deg: (v.mv - I20F12::from_num(500)) / 10,
+        }
+    }
+}
+
 struct Measurement {
-    temperature_millidegs: i32,
-    battery_millivolts: u32,
+    temperature: Temperature,
+    battery: Voltage,
     rtc_ms: u64,
 }
 
@@ -193,7 +217,7 @@ where
     }
 }
 
-async fn read_uv<const P: u8>(adc: &mut ADC<'_, ADC1>, pin: &mut SensorPin<P>) -> i32
+async fn read_voltage<const P: u8>(adc: &mut ADC<'_, ADC1>, pin: &mut SensorPin<P>) -> Voltage
 where
     GpioPin<Analog, P>: embedded_hal::adc::Channel<ADC1, ID = u8>,
 {
@@ -209,7 +233,16 @@ where
 
     total -= min;
     total -= max;
-    total as i32 * pin.atten.ref_mv() as i32 / 1024 * 1000 / 4 / 8
+
+    // Each of the 8 readings is at most 2^12, so the total is at most 2^15.
+    // ref_mv is around 2^10, so the product easily fits in 32 bits.
+    let avg = (total as i32 * pin.atten.ref_mv() as i32) / 8;
+
+    // The units of ref_mv are such that we need to divide by 2^12 to get back
+    // to mV. Casting to I20F12 serves the same purpose, while keeping the precision.
+    Voltage {
+        mv: I20F12::from_bits(avg),
+    }
 }
 
 struct Sensors {
@@ -249,29 +282,32 @@ impl Sensors {
         }
     }
 
-    /// Reads the current temperature in milli-degrees
-    async fn read_temperature(&mut self) -> i32 {
-        let mut ret = 0;
+    async fn read_temperature(&mut self) -> Temperature {
+        let mut ret = Temperature::default();
         const REPS: i32 = 16;
 
         for _ in 0..REPS {
-            let uv = read_uv(&mut self.adc, &mut self.temperature).await;
-            println!("temp {} uV", (uv - 500_000) / 10);
-            ret += (uv - 500_000) / 10;
+            let v = read_voltage(&mut self.adc, &mut self.temperature).await;
+            ret.deg += Temperature::from_tmp36_voltage(v).deg;
+            println!("temp {}", v);
         }
-        ret /= REPS;
+        ret.deg /= REPS;
         ret
     }
 
     /// Returns the current battery voltage, in millivolts.
-    async fn read_battery(&mut self) -> i32 {
+    async fn read_battery(&mut self) -> Voltage {
         let _ = self.battery_activate.set_high();
         Timer::after(Duration::from_millis(5)).await;
-        let uv = read_uv(&mut self.adc, &mut self.battery).await;
+        let mut v = read_voltage(&mut self.adc, &mut self.battery).await;
         let _ = self.battery_activate.set_low();
-        println!("batt {} uV", uv);
-        // There's a 10k and a 68k resistor involved, so we need to rescale the voltage back. TODO: explain better
-        uv * 78 / 10 / 1000
+        println!("batt {}", v);
+
+        // The voltage measurement is taken between a 68k resistor and a 10k
+        // resistor, so our measurement is 10/78ths of the original voltage.
+        v.mv *= 78;
+        v.mv /= 10;
+        v
     }
 }
 
@@ -425,15 +461,10 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
         let now = rtc.get_time_ms();
         let ms_ago = now.saturating_sub(meas.rtc_ms);
 
-        // FIXME: this is wrong for negative temperatures
         write!(
             &mut write,
-            "{{ \"sensor_id\": {}, \"temperature\": {}.{:03}, \"battery\": {}, \"ms_ago\": {} }}",
-            SENSOR_ID,
-            meas.temperature_millidegs / 1_000,
-            meas.temperature_millidegs % 1_000,
-            meas.battery_millivolts,
-            ms_ago
+            "{{ \"sensor_id\": {}, \"temperature\": {}, \"battery\": {}, \"ms_ago\": {} }}",
+            SENSOR_ID, meas.temperature.deg, meas.battery.mv, ms_ago
         )
         .unwrap();
 
@@ -474,8 +505,12 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     }
     measurements.clear();
     measurements.push(Measurement {
-        temperature_millidegs: 77,
-        battery_millivolts: 77,
+        temperature: Temperature {
+            deg: I20F12::from_num(77),
+        },
+        battery: Voltage {
+            mv: I20F12::from_num(77),
+        },
         rtc_ms: 77,
     });
 
@@ -525,13 +560,13 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
     );
     led.color(1, 1, 1).await;
 
-    let battery_millivolts = sensors.read_battery().await as u32;
-    let temperature_millidegs = sensors.read_temperature().await;
+    let battery = sensors.read_battery().await;
+    let temperature = sensors.read_temperature().await;
     let rtc_ms = rtc.get_time_ms();
     measurements.push(Measurement {
         rtc_ms,
-        temperature_millidegs,
-        battery_millivolts,
+        battery,
+        temperature,
     });
 
     led.color(0, 0, 0).await;
