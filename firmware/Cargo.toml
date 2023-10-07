@@ -5,6 +5,10 @@ authors = ["Joe Neeman <joeneeman@gmail.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[features]
+battery = []
+default = ["battery"]
+
 [dependencies]
 hal = { package = "esp32c3-hal", version = "0.12.0", features = ["embassy-time-timg0", "async"]}
 # defmt-rtt = "0.4.0"
@@ -24,6 +28,7 @@ embedded-hal = "0.2.7"
 embedded-hal-async = "1.0.0-rc.1"
 arrayvec = { version = "0.7.4", default-features = false }
 fixed = "1.24.0"
+time = { version = "0.3.29", default-features = false }
 
 [profile.dev]
 opt-level = 2

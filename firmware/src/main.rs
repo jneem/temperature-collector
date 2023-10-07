@@ -7,7 +7,7 @@ use core::fmt::{Display, Write};
 use arrayvec::ArrayVec;
 use embassy_executor::_export::StaticCell;
 use embassy_executor::{Executor, Spawner};
-use embassy_net::tcp::TcpSocket;
+use embassy_net::tcp::{ConnectError, TcpSocket};
 use embassy_net::{Ipv4Address, Stack, StackResources};
 use embassy_sync::channel;
 use embassy_time::{Duration, Timer};
@@ -30,9 +30,12 @@ use hal::systimer::SystemTimer;
 use hal::{clock::ClockControl, peripherals::Peripherals, timer::TimerGroup, Rtc};
 use hal::{prelude::*, Rng, IO};
 
+use temperature_firmware::{singleton, Measurement, Temperature, Voltage};
+
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const SENSOR_ID: &str = env!("SENSOR_ID");
+const INFLUX_TOKEN: &str = env!("INFLUX_TOKEN");
 const MS_PER_MEASUREMENT: u64 = 10_000;
 
 type Channel<T> =
@@ -49,36 +52,6 @@ static mut MEASUREMENT_BUFFER: MeasurementBuffer = ArrayVec::new_const();
 
 // A static bool, to put a safe API around MEASUREMENT_BUFFER.
 static INITED: StaticCell<()> = StaticCell::new();
-
-#[derive(Copy, Clone)]
-struct Voltage {
-    mv: I20F12,
-}
-
-impl Display for Voltage {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{} mV", self.mv)
-    }
-}
-
-#[derive(Copy, Clone, Default)]
-struct Temperature {
-    deg: I20F12,
-}
-
-impl Temperature {
-    fn from_tmp36_voltage(v: Voltage) -> Self {
-        Self {
-            deg: (v.mv - I20F12::from_num(500)) / 10,
-        }
-    }
-}
-
-struct Measurement {
-    temperature: Temperature,
-    battery: Voltage,
-    rtc_ms: u64,
-}
 
 fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
     // This will panic if it was already inited, making the following line safe
@@ -102,14 +75,14 @@ struct SensorPin<const P: u8> {
 }
 
 struct Writer {
-    buf: [u8; 256],
+    buf: [u8; 1024],
     cursor: usize,
 }
 
 impl Default for Writer {
     fn default() -> Self {
         Self {
-            buf: [0; 256],
+            buf: [0; 1024],
             cursor: 0,
         }
     }
@@ -118,6 +91,10 @@ impl Default for Writer {
 impl Writer {
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.cursor]).unwrap()
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.cursor]
     }
 
     fn clear(&mut self) {
@@ -139,11 +116,14 @@ impl core::fmt::Write for Writer {
     }
 }
 
-macro_rules! singleton {
-    ($val:expr, $typ:ty) => {{
-        static STATIC_CELL: StaticCell<$typ> = StaticCell::new();
-        STATIC_CELL.init($val)
-    }};
+macro_rules! write_buf {
+    ($w:expr, $buf:expr, $($rest:tt)*) => {
+        {
+            $buf.clear();
+            write!(&mut $buf, $($rest)*).unwrap();
+            embedded_io::asynch::Write::write_all(&mut $w, $buf.as_bytes()).await
+        }
+    }
 }
 
 struct Led {
@@ -250,6 +230,7 @@ struct Sensors {
     battery: SensorPin<3>,
     battery_activate: GpioPin<Output<PushPull>, 2>,
     temperature: SensorPin<4>,
+    temperature_activate: GpioPin<Output<PushPull>, 0>,
 }
 
 impl Sensors {
@@ -258,6 +239,7 @@ impl Sensors {
         battery: GpioPin<Unknown, 3>,
         battery_activate: GpioPin<Unknown, 2>,
         temperature: GpioPin<Unknown, 4>,
+        temperature_activate: GpioPin<Unknown, 0>,
         pcc: &mut PeripheralClockControl,
     ) -> Self {
         let atten = Attenuation::Attenuation2p5dB;
@@ -272,12 +254,12 @@ impl Sensors {
                 .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(battery.into_analog(), atten),
             atten,
         };
-        let battery_activate = battery_activate.into_push_pull_output();
         let adc1: ADC<'static, ADC1> = ADC::<ADC1>::adc(pcc, adc, adc_config).unwrap();
         Sensors {
             temperature: temp_pin,
+            temperature_activate: temperature_activate.into_push_pull_output(),
             battery: battery_pin,
-            battery_activate,
+            battery_activate: battery_activate.into_push_pull_output(),
             adc: adc1,
         }
     }
@@ -286,11 +268,13 @@ impl Sensors {
         let mut ret = Temperature::default();
         const REPS: i32 = 16;
 
+        let _ = self.temperature_activate.set_high();
         for _ in 0..REPS {
             let v = read_voltage(&mut self.adc, &mut self.temperature).await;
             ret.deg += Temperature::from_tmp36_voltage(v).deg;
             println!("temp {}", v);
         }
+        let _ = self.temperature_activate.set_low();
         ret.deg /= REPS;
         ret
     }
@@ -372,6 +356,94 @@ async fn connect(
     Err(WifiError::Disconnected)
 }
 
+enum SendMeasurementError {
+    Connect(ConnectError),
+    Tcp(embassy_net::tcp::Error),
+}
+
+impl From<embassy_net::tcp::Error> for SendMeasurementError {
+    fn from(v: embassy_net::tcp::Error) -> Self {
+        Self::Tcp(v)
+    }
+}
+
+impl From<ConnectError> for SendMeasurementError {
+    fn from(e: ConnectError) -> Self {
+        Self::Connect(e)
+    }
+}
+
+async fn send_measurements(
+    stack: &Stack<WifiDevice<'_>>,
+    rtc: &Rtc<'_>,
+    measurements: &MeasurementBuffer,
+) -> Result<(), SendMeasurementError> {
+    let mut write = Writer::default();
+    let mut req = Writer::default();
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
+
+    // FIXME: look up a domain name
+    let remote_endpoint = (Ipv4Address::new(192, 168, 86, 118), 8086);
+
+    // TODO: This is super bizarre. On deep sleep, the rtc_ms field in the
+    // first measurement always gets zeroed. We fix it by always ignoring the
+    // first measurement. (Below this loop, we stick in a dummy first measurement
+    // so that we aren't actually skipping any data.)
+    for meas in measurements.iter().skip(1) {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+        socket.connect(remote_endpoint).await?;
+
+        write.clear();
+        req.clear();
+
+        let now = rtc.get_time_ms();
+        let ms_ago = now.saturating_sub(meas.rtc_ms);
+
+        #[cfg(feature = "battery")]
+        write!(
+            &mut write,
+            "temperature,sensor_id={} temperature={},battery={} {}\n",
+            SENSOR_ID,
+            meas.temperature.degrees(),
+            // The collector expects an integer, so round it.
+            meas.battery.unwrap().mv().round(),
+            // FIXME: influx doesn't natively support relative times, see the workaround in
+            // https://github.com/influxdata/influxdb/issues/16166
+            ms_ago
+        )
+        .unwrap();
+
+        #[cfg(not(feature = "battery"))]
+        write!(
+            &mut write,
+            "{{ \"sensor_id\": {}, \"temperature\": {}, \"ms_ago\": {} }}",
+            SENSOR_ID, meas.temperature.deg, ms_ago
+        )
+        .unwrap();
+
+        use embedded_io::asynch::Write;
+        write_buf!(socket, req, "POST /collect HTTP/1.0\r\n").unwrap();
+        write_buf!(socket, req, "Connection: Close\r\n").unwrap();
+        write_buf!(socket, req, "Authorization: Token {}\r\n", INFLUX_TOKEN).unwrap();
+        write_buf!(socket, req, "Content-type: text/plain; charset=utf-8\r\n").unwrap();
+        write_buf!(socket, req, "Content-length: {}\r\n", write.len()).unwrap();
+        write_buf!(socket, req, "\r\n").unwrap();
+        write!(&mut req, "{}", write.as_str()).unwrap();
+
+        println!("sending request {}", req.as_str());
+
+        socket.write_all(req.as_str().as_bytes()).await?;
+
+        let mut read_buf = [0; 256];
+        while socket.read(&mut read_buf).await? > 0 {}
+        socket.close();
+    }
+
+    Ok(())
+}
+
 #[embassy_executor::task]
 async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer) {
     let peripherals = Peripherals::take();
@@ -436,83 +508,18 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     }
 
     led_channel.send(LedState::Sending).await;
-    let mut write = Writer::default();
-    let mut req = Writer::default();
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
 
-    let remote_endpoint = (Ipv4Address::new(192, 168, 86, 118), 3000);
-
-    // TODO: This is super bizarre. On deep sleep, the rtc_ms field in the
-    // first measurement always gets zeroed. We fix it by always ignoring the
-    // first measurement. (Below this loop, we stick in a dummy first measurement
-    // so that we aren't actually skipping any data.)
-    for meas in measurements.iter().skip(1) {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-        let r = socket.connect(remote_endpoint).await;
-        if let Err(e) = r {
-            println!("connect error: {:?}", e);
-        }
-
-        write.clear();
-        req.clear();
-
-        let now = rtc.get_time_ms();
-        let ms_ago = now.saturating_sub(meas.rtc_ms);
-
-        write!(
-            &mut write,
-            "{{ \"sensor_id\": {}, \"temperature\": {}, \"battery\": {}, \"ms_ago\": {} }}",
-            SENSOR_ID, meas.temperature.deg, meas.battery.mv, ms_ago
-        )
-        .unwrap();
-
-        write!(&mut req, "POST /collect HTTP/1.0\r\n").unwrap();
-        write!(&mut req, "Connection: Close\r\n").unwrap();
-        write!(&mut req, "Content-type: application/json\r\n").unwrap();
-        write!(&mut req, "Content-length: {}\r\n", write.len()).unwrap();
-        write!(&mut req, "\r\n").unwrap();
-        write!(&mut req, "{}", write.as_str()).unwrap();
-
-        println!("sending request {}", req.as_str());
-
-        use embedded_io::asynch::Write;
-        let r = socket.write_all(req.as_str().as_bytes()).await;
-        if let Err(e) = r {
-            println!("write error: {:?}", e);
-            // FIXME: this aborts. Try to recover instead
-            break;
-        }
-
-        let mut buf = [0; 256];
-        loop {
-            let n = match socket.read(&mut buf).await {
-                Ok(0) => {
-                    println!("read EOF");
-                    break;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    println!("read error: {:?}", e);
-                    break;
-                }
-            };
-            println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
-        }
-
-        socket.close();
+    let result = send_measurements(stack, &rtc, &*measurements).await;
+    if result.is_ok() {
+        measurements.clear();
+        measurements.push(Measurement {
+            temperature: Temperature {
+                deg: I20F12::from_num(77),
+            },
+            battery: None,
+            rtc_ms: 77,
+        });
     }
-    measurements.clear();
-    measurements.push(Measurement {
-        temperature: Temperature {
-            deg: I20F12::from_num(77),
-        },
-        battery: Voltage {
-            mv: I20F12::from_num(77),
-        },
-        rtc_ms: 77,
-    });
 
     led_channel.send(LedState::Idle).await;
     Timer::after(Duration::from_millis(100)).await;
@@ -546,6 +553,7 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
         io.pins.gpio3,
         io.pins.gpio2,
         io.pins.gpio4,
+        io.pins.gpio0,
         &mut system.peripheral_clock_control,
     );
 
@@ -560,7 +568,11 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
     );
     led.color(1, 1, 1).await;
 
-    let battery = sensors.read_battery().await;
+    #[cfg(feature = "battery")]
+    let battery = Some(sensors.read_battery().await);
+    #[cfg(not(feature = "battery"))]
+    let battery = None;
+
     let temperature = sensors.read_temperature().await;
     let rtc_ms = rtc.get_time_ms();
     measurements.push(Measurement {
