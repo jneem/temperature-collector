@@ -2,13 +2,12 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::{Display, Write};
-
 use arrayvec::ArrayVec;
 use embassy_executor::_export::StaticCell;
 use embassy_executor::{Executor, Spawner};
-use embassy_net::tcp::{ConnectError, TcpSocket};
-use embassy_net::{Ipv4Address, Stack, StackResources};
+use embassy_net::dns::DnsQueryType;
+use embassy_net::tcp::TcpSocket;
+use embassy_net::{Stack, StackResources};
 use embassy_sync::channel;
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::spi::SpiBus;
@@ -30,12 +29,15 @@ use hal::systimer::SystemTimer;
 use hal::{clock::ClockControl, peripherals::Peripherals, timer::TimerGroup, Rtc};
 use hal::{prelude::*, Rng, IO};
 
-use temperature_firmware::{singleton, Measurement, Temperature, Voltage};
+use temperature_firmware::{
+    get_time_from_influx, singleton, write_measurements, GetTimeError, Measurement, Temperature,
+    Voltage,
+};
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const SENSOR_ID: &str = env!("SENSOR_ID");
-const INFLUX_TOKEN: &str = env!("INFLUX_TOKEN");
+const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 const MS_PER_MEASUREMENT: u64 = 10_000;
 
 type Channel<T> =
@@ -72,58 +74,6 @@ fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
 struct SensorPin<const P: u8> {
     atten: Attenuation,
     pin: AdcPin<GpioPin<Analog, P>, ADC1, AdcCalLine<ADC1>>,
-}
-
-struct Writer {
-    buf: [u8; 1024],
-    cursor: usize,
-}
-
-impl Default for Writer {
-    fn default() -> Self {
-        Self {
-            buf: [0; 1024],
-            cursor: 0,
-        }
-    }
-}
-
-impl Writer {
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.buf[..self.cursor]).unwrap()
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.cursor]
-    }
-
-    fn clear(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn len(&self) -> usize {
-        self.cursor
-    }
-}
-
-impl core::fmt::Write for Writer {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        // TODO: error on buffer overflow
-        let len = s.len();
-        self.buf[self.cursor..(self.cursor + len)].copy_from_slice(s.as_bytes());
-        self.cursor += s.len();
-        Ok(())
-    }
-}
-
-macro_rules! write_buf {
-    ($w:expr, $buf:expr, $($rest:tt)*) => {
-        {
-            $buf.clear();
-            write!(&mut $buf, $($rest)*).unwrap();
-            embedded_io::asynch::Write::write_all(&mut $w, $buf.as_bytes()).await
-        }
-    }
 }
 
 struct Led {
@@ -357,89 +307,78 @@ async fn connect(
 }
 
 enum SendMeasurementError {
-    Connect(ConnectError),
-    Tcp(embassy_net::tcp::Error),
+    Connect(embassy_net::tcp::ConnectError),
+    Get(GetTimeError),
+    Send(temperature_firmware::SendMeasurementError),
+    Dns(embassy_net::dns::Error),
+    NoAddress,
 }
 
-impl From<embassy_net::tcp::Error> for SendMeasurementError {
-    fn from(v: embassy_net::tcp::Error) -> Self {
-        Self::Tcp(v)
+impl From<embassy_net::dns::Error> for SendMeasurementError {
+    fn from(v: embassy_net::dns::Error) -> Self {
+        Self::Dns(v)
     }
 }
 
-impl From<ConnectError> for SendMeasurementError {
-    fn from(e: ConnectError) -> Self {
-        Self::Connect(e)
+impl From<embassy_net::tcp::ConnectError> for SendMeasurementError {
+    fn from(v: embassy_net::tcp::ConnectError) -> Self {
+        Self::Connect(v)
+    }
+}
+
+impl From<temperature_firmware::SendMeasurementError> for SendMeasurementError {
+    fn from(v: temperature_firmware::SendMeasurementError) -> Self {
+        Self::Send(v)
+    }
+}
+
+impl From<GetTimeError> for SendMeasurementError {
+    fn from(v: GetTimeError) -> Self {
+        Self::Get(v)
     }
 }
 
 async fn send_measurements(
-    stack: &Stack<WifiDevice<'_>>,
+    stack: &Stack<WifiDevice<'static>>,
     rtc: &Rtc<'_>,
     measurements: &MeasurementBuffer,
 ) -> Result<(), SendMeasurementError> {
-    let mut write = Writer::default();
-    let mut req = Writer::default();
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
 
     // FIXME: look up a domain name
-    let remote_endpoint = (Ipv4Address::new(192, 168, 86, 118), 8086);
+    let address = stack.dns_query(INFLUX_SERVER, DnsQueryType::A).await?;
+    let address = *address.first().ok_or(SendMeasurementError::NoAddress)?;
 
-    // TODO: This is super bizarre. On deep sleep, the rtc_ms field in the
-    // first measurement always gets zeroed. We fix it by always ignoring the
-    // first measurement. (Below this loop, we stick in a dummy first measurement
-    // so that we aren't actually skipping any data.)
-    for meas in measurements.iter().skip(1) {
+    let remote_endpoint = (address, 8086);
+    // TODO: can we reuse the same socket and/or connection? It isn't super-trivial
+    // because without doing a one-shot connection we don't know when to stop trying
+    // to read from the HTTP response.
+    let date = {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
         socket.connect(remote_endpoint).await?;
 
-        write.clear();
-        req.clear();
-
-        let now = rtc.get_time_ms();
-        let ms_ago = now.saturating_sub(meas.rtc_ms);
-
-        #[cfg(feature = "battery")]
-        write!(
-            &mut write,
-            "temperature,sensor_id={} temperature={},battery={} {}\n",
-            SENSOR_ID,
-            meas.temperature.degrees(),
-            // The collector expects an integer, so round it.
-            meas.battery.unwrap().mv().round(),
-            // FIXME: influx doesn't natively support relative times, see the workaround in
-            // https://github.com/influxdata/influxdb/issues/16166
-            ms_ago
-        )
-        .unwrap();
-
-        #[cfg(not(feature = "battery"))]
-        write!(
-            &mut write,
-            "{{ \"sensor_id\": {}, \"temperature\": {}, \"ms_ago\": {} }}",
-            SENSOR_ID, meas.temperature.deg, ms_ago
-        )
-        .unwrap();
-
-        use embedded_io::asynch::Write;
-        write_buf!(socket, req, "POST /collect HTTP/1.0\r\n").unwrap();
-        write_buf!(socket, req, "Connection: Close\r\n").unwrap();
-        write_buf!(socket, req, "Authorization: Token {}\r\n", INFLUX_TOKEN).unwrap();
-        write_buf!(socket, req, "Content-type: text/plain; charset=utf-8\r\n").unwrap();
-        write_buf!(socket, req, "Content-length: {}\r\n", write.len()).unwrap();
-        write_buf!(socket, req, "\r\n").unwrap();
-        write!(&mut req, "{}", write.as_str()).unwrap();
-
-        println!("sending request {}", req.as_str());
-
-        socket.write_all(req.as_str().as_bytes()).await?;
-
-        let mut read_buf = [0; 256];
-        while socket.read(&mut read_buf).await? > 0 {}
+        let date = get_time_from_influx(&mut socket).await?;
         socket.close();
-    }
+        date
+    };
+
+    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+    socket.connect(remote_endpoint).await?;
+    // TODO: This is super bizarre. On deep sleep, the rtc_ms field in the
+    // first measurement always gets zeroed. We fix it by always ignoring the
+    // first measurement. (Below this loop, we stick in a dummy first measurement
+    // so that we aren't actually skipping any data.)
+    write_measurements(
+        &mut socket,
+        SENSOR_ID,
+        date.assume_utc(),
+        rtc,
+        measurements.iter().skip(1),
+    )
+    .await?;
 
     Ok(())
 }
@@ -458,8 +397,6 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
         &clocks,
         &mut system.peripheral_clock_control,
     );
-    // FIXME: do I have to do this *before* spawning an async task?
-    // I think not, based on the embassy::main macro.
     hal::embassy::init(&clocks, timer_group0.timer0);
 
     let led = Led::new(

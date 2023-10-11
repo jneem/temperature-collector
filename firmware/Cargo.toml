@@ -18,7 +18,7 @@ embassy-executor = { version = "0.2.0", features = ["executor-thread", "arch-ris
 embassy-time = { version = "0.1.1", features = [] }
 esp-wifi = { git = "https://github.com/esp-rs/esp-wifi", features = ["esp32c3", "wifi", "embedded-svc", "embassy-net"]}
 embedded-svc = { version = "0.25.3", default-features = false }
-embassy-net = { version = "0.1.0", features = ["tcp", "medium-ethernet", "dhcpv4", "nightly"] }
+embassy-net = { version = "0.1.0", features = ["tcp", "medium-ethernet", "dhcpv4", "nightly", "dns"] }
 smoltcp = { version = "0.9.1", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ip"] }
 embassy-sync = "0.2.0"
 embedded-io = "0.4.0"

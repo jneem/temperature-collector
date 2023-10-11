@@ -2,10 +2,12 @@
 #![no_std]
 #![no_main]
 
+use arrayvec::ArrayVec;
 use embassy_executor::_export::StaticCell;
 use embassy_executor::{Executor, Spawner};
+use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Ipv4Address, Stack, StackResources};
+use embassy_net::{Stack, StackResources};
 use embassy_time::{Duration, Timer};
 use embedded_svc::wifi::{Configuration, Wifi};
 use esp_backtrace as _;
@@ -97,7 +99,11 @@ async fn embassy_main(spawner: Spawner) {
 
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
-    let remote_endpoint = (Ipv4Address::new(192, 168, 86, 118), 8086);
+    let address = stack
+        .dns_query("alexandria", DnsQueryType::A)
+        .await
+        .unwrap()[0];
+    let remote_endpoint = (address, 8086);
 
     let date = {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -113,11 +119,18 @@ async fn embassy_main(spawner: Spawner) {
         date
     };
 
+    let mut measurements = ArrayVec::<_, 256>::new();
+
+    let rtc_now = rtc.get_time_ms();
     let measurement = Measurement {
-        temperature: Temperature::from_degrees(77),
+        temperature: Temperature::from_degrees(55),
         battery: Some(Voltage::from_v(8)),
-        rtc_ms: 0,
+        rtc_ms: rtc_now,
     };
+
+    while !measurements.is_full() {
+        measurements.push(measurement.clone());
+    }
 
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
@@ -127,10 +140,9 @@ async fn embassy_main(spawner: Spawner) {
         SENSOR_ID,
         date.assume_utc(),
         &rtc,
-        core::iter::once(&measurement),
+        measurements.iter(),
     )
     .await
-    .ok()
     .unwrap();
     socket.close();
 }

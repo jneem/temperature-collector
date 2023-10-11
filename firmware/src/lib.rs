@@ -4,11 +4,14 @@ use core::fmt::{Display, Write};
 
 use arrayvec::ArrayVec;
 use embassy_net::tcp::TcpSocket;
+use esp_println::println;
 use fixed::{traits::ToFixed, types::I20F12};
 use hal::Rtc;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime};
 
+// TODO: pass these as parameters instead of hard-coding them into the lib?
 const INFLUX_TOKEN: &str = env!("INFLUX_TOKEN");
+const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 
 #[derive(Copy, Clone)]
 pub struct Voltage {
@@ -60,6 +63,7 @@ impl Temperature {
     }
 }
 
+#[derive(Clone)]
 pub struct Measurement {
     pub temperature: Temperature,
     pub battery: Option<Voltage>,
@@ -154,6 +158,17 @@ impl<const S: usize> WriteBuf<S> {
     pub fn as_bytes(&self) -> &[u8] {
         self.buf.as_slice()
     }
+
+    pub fn clear(&mut self) {
+        self.buf.clear()
+    }
+
+    pub async fn write_http_chunk<const CAP: usize>(&mut self, w: &mut SocketWriter<'_, '_, CAP>) {
+        write!(w, "{:X}\r\n", self.buf.len()).await.unwrap();
+        w.write_bytes(self.as_bytes()).await.unwrap();
+        write!(w, "\r\n").await.unwrap();
+        self.clear();
+    }
 }
 
 pub struct SocketWriter<'a, 'b: 'a, const CAP: usize> {
@@ -161,6 +176,7 @@ pub struct SocketWriter<'a, 'b: 'a, const CAP: usize> {
     buf: WriteBuf<CAP>,
 }
 
+#[derive(Debug)]
 pub enum SocketWriterError {
     TooLong,
     Tcp(embassy_net::tcp::Error),
@@ -213,6 +229,7 @@ impl<'a, 'b: 'a, const CAP: usize> SocketWriter<'a, 'b, CAP> {
     }
 }
 
+#[derive(Debug)]
 pub enum SocketReaderError {
     TooLong,
     Tcp(embassy_net::tcp::Error),
@@ -286,6 +303,7 @@ pub async fn get_time_from_influx(
     Err(GetTimeError::NoTime)
 }
 
+#[derive(Debug)]
 pub enum SendMeasurementError {
     Write(SocketWriterError),
     Read(SocketReaderError),
@@ -325,8 +343,20 @@ pub async fn write_measurements(
     measurements: impl Iterator<Item = &Measurement>,
 ) -> Result<(), SendMeasurementError> {
     let mut w = SocketWriter::<1024>::new(socket);
+
+    write!(
+        w,
+        "POST /api/v2/write?org=treeman-ranch&bucket=temperatures&precision=s HTTP/1.1\r\n"
+    )
+    .await?;
+    write!(w, "Host: {}\r\n", INFLUX_SERVER).await?;
+    write!(w, "Authorization: Token {}\r\n", INFLUX_TOKEN).await?;
+    write!(w, "Content-type: text/plain; charset=utf-8\r\n").await?;
+    write!(w, "Transfer-encoding: chunked\r\n").await?;
+    write!(w, "Connection: Close\r\n").await?;
+    write!(w, "\r\n").await?;
+
     let mut body = WriteBuf::<4096>::default();
-    let mut req = WriteBuf::<4096>::default();
 
     let base_secs = now.unix_timestamp();
     let rtc_now = rtc.get_time_ms();
@@ -336,6 +366,12 @@ pub async fn write_measurements(
         rtc_ms,
     } in measurements
     {
+        // TODO: is it ok to optimistically write to the body and catch the error? What
+        // state does it leave the body in?
+        if body.buf.remaining_capacity() <= 100 {
+            body.write_http_chunk(&mut w).await;
+        }
+
         let secs_ago = (rtc_now.saturating_sub(*rtc_ms) + 500) / 1000;
         let ts = base_secs - secs_ago as i64;
         let deg = temperature.degrees();
@@ -351,22 +387,12 @@ pub async fn write_measurements(
                 "tempSensors,sensor_id={sensor_id} temperature={deg:.2} {ts}"
             )?;
         }
+        println!("body len {}", body.len());
     }
 
-    write!(
-        req,
-        "POST /api/v2/write?org=treeman-ranch&bucket=temperatures&precision=s HTTP/1.0\r\n"
-    )?;
-    write!(req, "Authorization: Token {}\r\n", INFLUX_TOKEN)?;
-    write!(req, "Content-type: text/plain; charset=utf-8\r\n")?;
-    write!(req, "Content-length: {}\r\n", body.len())?;
-    write!(req, "Connection: Close\r\n")?;
-    write!(req, "\r\n")?;
-    req.buf.try_extend_from_slice(body.as_bytes()).unwrap();
-    //w.write_bytes(body.as_bytes()).await?;
-    esp_println::println!("{}", core::str::from_utf8(req.as_bytes()).unwrap());
-
-    w.write_bytes(req.as_bytes()).await?;
+    body.write_http_chunk(&mut w).await;
+    // Write the last (empty) chunk.
+    write!(w, "0\r\n\r\n").await?;
     w.flush().await?;
 
     // We don't expect the server to care if we drop the connection without reading
