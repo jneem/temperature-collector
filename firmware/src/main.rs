@@ -38,7 +38,7 @@ const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const SENSOR_ID: &str = env!("SENSOR_ID");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
-const MS_PER_MEASUREMENT: u64 = 10_000;
+const MS_PER_MEASUREMENT: u64 = 15_000;
 
 type Channel<T> =
     channel::Channel<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
@@ -47,7 +47,7 @@ type Receiver<T> =
 type Sender<T> =
     channel::Sender<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
 
-type MeasurementBuffer = ArrayVec<Measurement, 64>;
+type MeasurementBuffer = ArrayVec<Measurement, 256>;
 
 #[ram(rtc_fast, uninitialized)]
 static mut MEASUREMENT_BUFFER: MeasurementBuffer = ArrayVec::new_const();
@@ -237,10 +237,9 @@ impl Sensors {
         let _ = self.battery_activate.set_low();
         println!("batt {}", v);
 
-        // The voltage measurement is taken between a 68k resistor and a 10k
-        // resistor, so our measurement is 10/78ths of the original voltage.
-        v.mv *= 78;
-        v.mv /= 10;
+        // The voltage measurement is taken between a 33k resistor and a 100k
+        // resistor, so our measurement is 1/4th of the original voltage.
+        v.mv *= 4;
         v
     }
 }
@@ -346,7 +345,6 @@ async fn send_measurements(
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
 
-    // FIXME: look up a domain name
     let address = stack.dns_query(INFLUX_SERVER, DnsQueryType::A).await?;
     let address = *address.first().ok_or(SendMeasurementError::NoAddress)?;
 
