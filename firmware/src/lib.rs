@@ -1,10 +1,12 @@
 #![no_std]
+#![feature(type_alias_impl_trait)]
 
 use core::fmt::{Display, Write};
 
 use arrayvec::ArrayVec;
-use embassy_net::tcp::TcpSocket;
+use embassy_net::{tcp::TcpSocket, Stack};
 use esp_println::println;
+use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
 use fixed::{traits::ToFixed, types::I20F12};
 use hal::Rtc;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime};
@@ -208,7 +210,7 @@ impl<'a, 'b: 'a, const CAP: usize> SocketWriter<'a, 'b, CAP> {
     }
 
     async fn flush_buf(&mut self) -> Result<(), SocketWriterError> {
-        embedded_io::asynch::Write::write_all(&mut self.socket, self.buf.buf.as_slice())
+        embedded_io_async::Write::write_all(&mut self.socket, self.buf.buf.as_slice())
             .await
             .map_err(SocketWriterError::Tcp)?;
         self.buf.buf.clear();
@@ -223,7 +225,7 @@ impl<'a, 'b: 'a, const CAP: usize> SocketWriter<'a, 'b, CAP> {
 
     pub async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SocketWriterError> {
         self.flush_buf().await?;
-        embedded_io::asynch::Write::write_all(&mut self.socket, bytes)
+        embedded_io_async::Write::write_all(&mut self.socket, bytes)
             .await
             .map_err(SocketWriterError::Tcp)
     }
@@ -258,8 +260,8 @@ impl<'a, 'b: 'a, const CAP: usize> SocketReader<'a, 'b, CAP> {
 
     pub async fn read_all(&mut self) -> Result<(), SocketReaderError> {
         while self.end < self.buf.len() {
-            let n = embedded_io::asynch::Read::read(&mut self.socket, &mut self.buf[self.end..])
-                .await?;
+            let n =
+                embedded_io_async::Read::read(&mut self.socket, &mut self.buf[self.end..]).await?;
             if n == 0 {
                 return Ok(());
             } else {
@@ -405,4 +407,9 @@ pub async fn write_measurements(
     socket.close();
 
     Ok(())
+}
+
+#[embassy_executor::task]
+pub async fn net_task(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
+    stack.run().await
 }

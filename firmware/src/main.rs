@@ -3,7 +3,6 @@
 #![no_main]
 
 use arrayvec::ArrayVec;
-use embassy_executor::_export::StaticCell;
 use embassy_executor::{Executor, Spawner};
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
@@ -14,7 +13,7 @@ use embedded_hal_async::spi::SpiBus;
 use embedded_svc::wifi::{Configuration, Wifi};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_wifi::wifi::{WifiController, WifiDevice, WifiError, WifiMode};
+use esp_wifi::wifi::{WifiController, WifiDevice, WifiError, WifiStaDevice};
 use esp_wifi::EspWifiInitFor;
 use fixed::types::I20F12;
 use hal::adc::{AdcCalLine, AdcConfig, AdcPin, Attenuation, ADC, ADC1};
@@ -23,11 +22,12 @@ use hal::dma::DmaPriority;
 use hal::gdma::{self, Gdma};
 use hal::gpio::{Analog, GpioPin, Output, PushPull, Unknown};
 use hal::rtc_cntl::sleep::TimerWakeupSource;
+use hal::spi::master::dma::WithDmaSpi2;
 use hal::spi::{FullDuplexMode, SpiMode};
-use hal::system::PeripheralClockControl;
 use hal::systimer::SystemTimer;
 use hal::{clock::ClockControl, peripherals::Peripherals, timer::TimerGroup, Rtc};
 use hal::{prelude::*, Rng, IO};
+use static_cell::StaticCell;
 
 use temperature_firmware::{
     get_time_from_influx, singleton, write_measurements, GetTimeError, Measurement, Temperature,
@@ -47,7 +47,7 @@ type Receiver<T> =
 type Sender<T> =
     channel::Sender<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
 
-type MeasurementBuffer = ArrayVec<Measurement, 256>;
+type MeasurementBuffer = ArrayVec<Measurement, 64>;
 
 #[ram(rtc_fast, uninitialized)]
 static mut MEASUREMENT_BUFFER: MeasurementBuffer = ArrayVec::new_const();
@@ -77,7 +77,12 @@ struct SensorPin<const P: u8> {
 }
 
 struct Led {
-    spi: hal::spi::dma::SpiDma<'static, hal::peripherals::SPI2, gdma::Channel0, FullDuplexMode>,
+    spi: hal::spi::master::dma::SpiDma<
+        'static,
+        hal::peripherals::SPI2,
+        gdma::Channel0,
+        FullDuplexMode,
+    >,
     buf: [u8; 48],
 }
 
@@ -87,7 +92,6 @@ impl Led {
         spi: hal::peripherals::SPI2,
         pin: GpioPin<Unknown, 7>,
         clocks: &Clocks,
-        cc: &mut PeripheralClockControl,
     ) -> Self {
         let descriptors = singleton!([0u32; 8 * 3], [u32; 8 * 3]);
         hal::interrupt::enable(
@@ -96,13 +100,14 @@ impl Led {
         )
         .unwrap();
 
-        let dma = Gdma::new(dma, cc);
+        let dma = Gdma::new(dma);
         let dma_channel =
             dma.channel0
                 .configure(false, descriptors, &mut [], DmaPriority::Priority0);
 
-        let spi = hal::spi::Spi::new_mosi_only(spi, pin, 3333u32.kHz(), SpiMode::Mode0, cc, clocks)
-            .with_dma(dma_channel);
+        let spi =
+            hal::spi::master::Spi::new_mosi_only(spi, pin, 3333u32.kHz(), SpiMode::Mode0, clocks)
+                .with_dma(dma_channel);
         Self { spi, buf: [0; 48] }
     }
 
@@ -164,9 +169,7 @@ where
     total -= min;
     total -= max;
 
-    // Each of the 8 readings is at most 2^12, so the total is at most 2^15.
-    // ref_mv is around 2^10, so the product easily fits in 32 bits.
-    let avg = (total as i32 * pin.atten.ref_mv() as i32) / 8;
+    let avg = total as i32 * (4096 / 8);
 
     // The units of ref_mv are such that we need to divide by 2^12 to get back
     // to mV. Casting to I20F12 serves the same purpose, while keeping the precision.
@@ -190,7 +193,6 @@ impl Sensors {
         battery_activate: GpioPin<Unknown, 2>,
         temperature: GpioPin<Unknown, 4>,
         temperature_activate: GpioPin<Unknown, 0>,
-        pcc: &mut PeripheralClockControl,
     ) -> Self {
         let atten = Attenuation::Attenuation2p5dB;
         let mut adc_config = AdcConfig::new();
@@ -204,7 +206,7 @@ impl Sensors {
                 .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(battery.into_analog(), atten),
             atten,
         };
-        let adc1: ADC<'static, ADC1> = ADC::<ADC1>::adc(pcc, adc, adc_config).unwrap();
+        let adc1: ADC<'static, ADC1> = ADC::<ADC1>::adc(adc, adc_config).unwrap();
         Sensors {
             temperature: temp_pin,
             temperature_activate: temperature_activate.into_push_pull_output(),
@@ -269,7 +271,7 @@ fn main() -> ! {
 
 async fn connect(
     mut controller: WifiController<'static>,
-    stack: &'static Stack<WifiDevice<'static>>,
+    stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>,
     led: Sender<LedState>,
 ) -> Result<(), WifiError> {
     let client_config = Configuration::Client(embedded_svc::wifi::ClientConfiguration {
@@ -338,7 +340,7 @@ impl From<GetTimeError> for SendMeasurementError {
 }
 
 async fn send_measurements(
-    stack: &Stack<WifiDevice<'static>>,
+    stack: &Stack<WifiDevice<'static, WifiStaDevice>>,
     rtc: &Rtc<'_>,
     measurements: &MeasurementBuffer,
 ) -> Result<(), SendMeasurementError> {
@@ -384,26 +386,16 @@ async fn send_measurements(
 #[embassy_executor::task]
 async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer) {
     let peripherals = Peripherals::take();
-    let mut system = peripherals.SYSTEM.split();
+    let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::max(system.clock_control).freeze();
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
 
     let mut rtc = Rtc::new(peripherals.RTC_CNTL);
 
-    let timer_group0 = TimerGroup::new(
-        peripherals.TIMG0,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
+    let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
     hal::embassy::init(&clocks, timer_group0.timer0);
 
-    let led = Led::new(
-        peripherals.DMA,
-        peripherals.SPI2,
-        io.pins.gpio7,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
+    let led = Led::new(peripherals.DMA, peripherals.SPI2, io.pins.gpio7, &clocks);
 
     let led_channel = singleton!(Channel::new(), Channel<LedState>);
 
@@ -417,17 +409,17 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     )
     .unwrap();
 
-    let wifi = peripherals.RADIO.split().0;
+    let wifi = peripherals.WIFI;
     let (wifi_interface, controller) =
-        esp_wifi::wifi::new_with_mode(&init, wifi, WifiMode::Sta).unwrap();
+        esp_wifi::wifi::new_with_mode(&init, wifi, WifiStaDevice).unwrap();
     let stack_resources = singleton!(StackResources::new(), StackResources::<3>);
     let dhcp_config = embassy_net::Config::dhcpv4(Default::default());
     let stack = singleton!(
         Stack::new(wifi_interface, dhcp_config, stack_resources, 1234,),
-        Stack<WifiDevice<'static>>
+        Stack<WifiDevice<'static, WifiStaDevice>>
     );
 
-    spawner.must_spawn(net_task(stack));
+    spawner.must_spawn(temperature_firmware::net_task(stack));
     spawner.must_spawn(led_task(led, led_channel.receiver()));
     led_channel.send(LedState::WaitingForNetwork).await;
 
@@ -472,15 +464,11 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
 #[embassy_executor::task]
 async fn measure(measurements: &'static mut MeasurementBuffer) {
     let peripherals = Peripherals::take();
-    let mut system = peripherals.SYSTEM.split();
+    let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::configure(system.clock_control, CpuClock::Clock80MHz).freeze();
 
     let mut rtc = Rtc::new(peripherals.RTC_CNTL);
-    let timer_group0 = TimerGroup::new(
-        peripherals.TIMG0,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
+    let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
     let analog = peripherals.APB_SARADC.split();
     let mut sensors = Sensors::new(
@@ -489,18 +477,11 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
         io.pins.gpio2,
         io.pins.gpio4,
         io.pins.gpio0,
-        &mut system.peripheral_clock_control,
     );
 
     hal::embassy::init(&clocks, timer_group0.timer0);
 
-    let mut led = Led::new(
-        peripherals.DMA,
-        peripherals.SPI2,
-        io.pins.gpio7,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
+    let mut led = Led::new(peripherals.DMA, peripherals.SPI2, io.pins.gpio7, &clocks);
     led.color(1, 1, 1).await;
 
     #[cfg(feature = "battery")]
@@ -553,7 +534,7 @@ enum LedState {
 async fn led_task(mut led: Led, state: Receiver<LedState>) {
     led.color(0, 0, 0).await;
     loop {
-        let state = state.recv().await;
+        let state = state.receive().await;
 
         match state {
             LedState::WaitingForNetwork => led.color(8, 0, 0).await,
@@ -562,9 +543,4 @@ async fn led_task(mut led: Led, state: Receiver<LedState>) {
             LedState::Other => led.color(0, 1, 2).await,
         }
     }
-}
-
-#[embassy_executor::task]
-async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
-    stack.run().await
 }
