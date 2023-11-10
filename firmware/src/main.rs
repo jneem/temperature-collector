@@ -16,11 +16,11 @@ use esp_println::println;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiError, WifiStaDevice};
 use esp_wifi::EspWifiInitFor;
 use fixed::types::I20F12;
-use hal::adc::{AdcCalLine, AdcConfig, AdcPin, Attenuation, ADC, ADC1};
+use hal::adc::Attenuation;
 use hal::clock::{Clocks, CpuClock};
 use hal::dma::DmaPriority;
 use hal::gdma::{self, Gdma};
-use hal::gpio::{Analog, GpioPin, Output, PushPull, Unknown};
+use hal::gpio::{GpioPin, Unknown};
 use hal::rtc_cntl::sleep::TimerWakeupSource;
 use hal::spi::master::dma::WithDmaSpi2;
 use hal::spi::{FullDuplexMode, SpiMode};
@@ -31,7 +31,6 @@ use static_cell::StaticCell;
 
 use temperature_firmware::{
     get_time_from_influx, singleton, write_measurements, GetTimeError, Measurement, Temperature,
-    Voltage,
 };
 
 const SSID: &str = env!("SSID");
@@ -69,11 +68,6 @@ fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
     }
 
     unsafe { &mut MEASUREMENT_BUFFER }
-}
-
-struct SensorPin<const P: u8> {
-    atten: Attenuation,
-    pin: AdcPin<GpioPin<Analog, P>, ADC1, AdcCalLine<ADC1>>,
 }
 
 struct Led {
@@ -129,120 +123,6 @@ impl Led {
             *out = patterns[bits as usize];
             b <<= 2;
         }
-    }
-}
-
-async fn read_raw<const P: u8>(
-    adc: &mut ADC<'_, ADC1>,
-    pin: &mut AdcPin<GpioPin<Analog, P>, ADC1, AdcCalLine<ADC1>>,
-) -> u16
-where
-    GpioPin<Analog, P>: embedded_hal::adc::Channel<ADC1, ID = u8>,
-{
-    loop {
-        let pin_value: nb::Result<u16, _> = adc.read(pin);
-        if let Ok(val) = pin_value {
-            println!("read {}", val);
-            return val;
-        } else {
-            // adc.read never returns an error other than WouldBlock, so we
-            // can assume it's WouldBlock here.
-            Timer::after(Duration::from_micros(50)).await;
-        }
-    }
-}
-
-async fn read_voltage<const P: u8>(adc: &mut ADC<'_, ADC1>, pin: &mut SensorPin<P>) -> Voltage
-where
-    GpioPin<Analog, P>: embedded_hal::adc::Channel<ADC1, ID = u8>,
-{
-    let mut total = read_raw(adc, &mut pin.pin).await;
-    let mut max = total;
-    let mut min = total;
-    for _ in 0..9 {
-        let reading = read_raw(adc, &mut pin.pin).await;
-        max = max.max(reading);
-        min = min.min(reading);
-        total += reading;
-    }
-
-    total -= min;
-    total -= max;
-
-    let avg = total as i32 * (4096 / 8);
-
-    // The units of ref_mv are such that we need to divide by 2^12 to get back
-    // to mV. Casting to I20F12 serves the same purpose, while keeping the precision.
-    Voltage {
-        mv: I20F12::from_bits(avg),
-    }
-}
-
-struct Sensors {
-    adc: ADC<'static, ADC1>,
-    battery: SensorPin<3>,
-    battery_activate: GpioPin<Output<PushPull>, 2>,
-    temperature: SensorPin<4>,
-    temperature_activate: GpioPin<Output<PushPull>, 0>,
-}
-
-impl Sensors {
-    fn new(
-        adc: ADC1,
-        battery: GpioPin<Unknown, 3>,
-        battery_activate: GpioPin<Unknown, 2>,
-        temperature: GpioPin<Unknown, 4>,
-        temperature_activate: GpioPin<Unknown, 0>,
-    ) -> Self {
-        let atten = Attenuation::Attenuation2p5dB;
-        let mut adc_config = AdcConfig::new();
-        let temp_pin = SensorPin {
-            pin: adc_config
-                .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(temperature.into_analog(), atten),
-            atten,
-        };
-        let battery_pin = SensorPin {
-            pin: adc_config
-                .enable_pin_with_cal::<_, AdcCalLine<ADC1>>(battery.into_analog(), atten),
-            atten,
-        };
-        let adc1: ADC<'static, ADC1> = ADC::<ADC1>::adc(adc, adc_config).unwrap();
-        Sensors {
-            temperature: temp_pin,
-            temperature_activate: temperature_activate.into_push_pull_output(),
-            battery: battery_pin,
-            battery_activate: battery_activate.into_push_pull_output(),
-            adc: adc1,
-        }
-    }
-
-    async fn read_temperature(&mut self) -> Temperature {
-        let mut ret = Temperature::default();
-        const REPS: i32 = 16;
-
-        let _ = self.temperature_activate.set_high();
-        for _ in 0..REPS {
-            let v = read_voltage(&mut self.adc, &mut self.temperature).await;
-            ret.deg += Temperature::from_tmp36_voltage(v).deg;
-            println!("temp {}", v);
-        }
-        let _ = self.temperature_activate.set_low();
-        ret.deg /= REPS;
-        ret
-    }
-
-    /// Returns the current battery voltage, in millivolts.
-    async fn read_battery(&mut self) -> Voltage {
-        let _ = self.battery_activate.set_high();
-        Timer::after(Duration::from_millis(5)).await;
-        let mut v = read_voltage(&mut self.adc, &mut self.battery).await;
-        let _ = self.battery_activate.set_low();
-        println!("batt {}", v);
-
-        // The voltage measurement is taken between a 33k resistor and a 100k
-        // resistor, so our measurement is 1/4th of the original voltage.
-        v.mv *= 4;
-        v
     }
 }
 
@@ -471,13 +351,19 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
     let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
     let analog = peripherals.APB_SARADC.split();
-    let mut sensors = Sensors::new(
-        analog.adc1,
-        io.pins.gpio3,
-        io.pins.gpio2,
-        io.pins.gpio4,
-        io.pins.gpio0,
+
+    let mut builder = temperature_firmware::analog::AdcBuilder::default();
+    let mut battery_sensor = builder.add_activated_pin(
+        io.pins.gpio3.into_analog(),
+        io.pins.gpio2.into_push_pull_output(),
+        Attenuation::Attenuation2p5dB,
     );
+    let mut temperature_sensor = builder.add_activated_pin(
+        io.pins.gpio4.into_analog(),
+        io.pins.gpio0.into_push_pull_output(),
+        Attenuation::Attenuation2p5dB,
+    );
+    let mut adc = builder.build(analog.adc1);
 
     hal::embassy::init(&clocks, timer_group0.timer0);
 
@@ -485,11 +371,12 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
     led.color(1, 1, 1).await;
 
     #[cfg(feature = "battery")]
-    let battery = Some(sensors.read_battery().await);
+    let battery = Some(battery_sensor.read_voltage(&mut adc).await / 4);
     #[cfg(not(feature = "battery"))]
     let battery = None;
 
-    let temperature = sensors.read_temperature().await;
+    let temperature =
+        Temperature::from_tmp36_voltage(temperature_sensor.read_voltage(&mut adc).await);
     let rtc_ms = rtc.get_time_ms();
     measurements.push(Measurement {
         rtc_ms,

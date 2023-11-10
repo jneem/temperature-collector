@@ -15,12 +15,16 @@ use time::{Date, Month, OffsetDateTime, PrimitiveDateTime};
 const INFLUX_TOKEN: &str = env!("INFLUX_TOKEN");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 
+pub mod analog;
+
 #[derive(Copy, Clone)]
 pub struct Voltage {
     pub mv: I20F12,
 }
 
 impl Voltage {
+    pub const ZERO: Voltage = Voltage { mv: I20F12::ZERO };
+
     pub fn mv(&self) -> I20F12 {
         self.mv
     }
@@ -39,6 +43,16 @@ impl Voltage {
 impl Display for Voltage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{} mV", self.mv)
+    }
+}
+
+impl<Rhs: ToFixed> core::ops::Div<Rhs> for Voltage {
+    type Output = Voltage;
+
+    fn div(self, rhs: Rhs) -> Self::Output {
+        Voltage {
+            mv: self.mv / rhs.to_fixed::<I20F12>(),
+        }
     }
 }
 

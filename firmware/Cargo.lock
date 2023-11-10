@@ -1404,6 +1404,7 @@ dependencies = [
  "embedded-io-async",
  "embedded-svc",
  "esp-backtrace",
+ "esp-hal-common",
  "esp-println",
  "esp-wifi",
  "esp32c3-hal",

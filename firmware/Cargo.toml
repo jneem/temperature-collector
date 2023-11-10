@@ -31,6 +31,7 @@ fixed = "1.24.0"
 time = { version = "0.3.29", default-features = false }
 embedded-io-async = "0.6.0"
 static_cell = "=1.2.0"
+esp-hal-common = "0.13.1"
 
 [profile.dev]
 opt-level = 2
