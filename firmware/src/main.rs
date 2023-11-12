@@ -3,7 +3,7 @@
 #![no_main]
 
 use arrayvec::ArrayVec;
-use embassy_executor::{Executor, Spawner};
+use embassy_executor::Spawner;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Stack, StackResources};
@@ -126,19 +126,16 @@ impl Led {
     }
 }
 
-#[entry]
-fn main() -> ! {
-    let executor = singleton!(Executor::new(), Executor);
+#[main]
+async fn main(spawner: Spawner) -> ! {
     let measurements = get_measurement_buffer();
     println!("buffer has {} measurements", measurements.len());
 
-    executor.run(|spawner| {
-        if measurements.is_full() {
-            spawner.must_spawn(transmit(spawner, measurements));
-        } else {
-            spawner.must_spawn(measure(measurements));
-        }
-    });
+    if measurements.is_full() {
+        transmit(spawner, measurements).await;
+    } else {
+        measure(measurements).await;
+    }
 
     // The unreachable!() shuts up a rust-analyzer warning (because ra doesn't
     // realize that executor.run diverges), and the `allow` shuts up a rustc warning
@@ -263,7 +260,6 @@ async fn send_measurements(
     Ok(())
 }
 
-#[embassy_executor::task]
 async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer) {
     let peripherals = Peripherals::take();
     let system = peripherals.SYSTEM.split();
@@ -340,8 +336,6 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     rtc.sleep_deep(&[&mut wake], &mut delay);
 }
 
-// TODO: can we make this an embassy_executor::main?
-#[embassy_executor::task]
 async fn measure(measurements: &'static mut MeasurementBuffer) {
     let peripherals = Peripherals::take();
     let system = peripherals.SYSTEM.split();
@@ -353,6 +347,7 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
     let analog = peripherals.APB_SARADC.split();
 
     let mut builder = temperature_firmware::analog::AdcBuilder::default();
+    #[cfg(feature = "battery")]
     let mut battery_sensor = builder.add_activated_pin(
         io.pins.gpio3.into_analog(),
         io.pins.gpio2.into_push_pull_output(),
@@ -371,7 +366,7 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
     led.color(1, 1, 1).await;
 
     #[cfg(feature = "battery")]
-    let battery = Some(battery_sensor.read_voltage(&mut adc).await / 4);
+    let battery = Some(battery_sensor.read_voltage(&mut adc).await * 4);
     #[cfg(not(feature = "battery"))]
     let battery = None;
 

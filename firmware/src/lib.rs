@@ -56,6 +56,16 @@ impl<Rhs: ToFixed> core::ops::Div<Rhs> for Voltage {
     }
 }
 
+impl<Rhs: ToFixed> core::ops::Mul<Rhs> for Voltage {
+    type Output = Voltage;
+
+    fn mul(self, rhs: Rhs) -> Self::Output {
+        Voltage {
+            mv: self.mv * rhs.to_fixed::<I20F12>(),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Default)]
 pub struct Temperature {
     pub deg: I20F12,
