@@ -258,9 +258,9 @@ dependencies = [
 
 [[package]]
 name = "embassy-futures"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e5367165d347c039360f784812f493b001583ab6a3dd8622f4ce9c30374ec3"
+checksum = "1f878075b9794c1e4ac788c95b728f26aa6366d32eeb10c7051389f898f7d067"
 
 [[package]]
 name = "embassy-macros"
@@ -432,9 +432,9 @@ dependencies = [
 
 [[package]]
 name = "embedded-svc"
-version = "0.26.2"
+version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72eadca5c944d68cef49d9fcba75d89bca6a742aa31ee744382684805c9af6f3"
+checksum = "55feac55fb81e14c747d5475f05ead553855a133a36f979fa4e7883a240ee829"
 dependencies = [
  "atomic-waker",
  "embedded-io",
@@ -586,7 +586,7 @@ dependencies = [
 [[package]]
 name = "esp-wifi"
 version = "0.1.0"
-source = "git+https://github.com/esp-rs/esp-wifi#69ed0653a5c117d0a1df4bea6ff16f14d483b5c5"
+source = "git+https://github.com/esp-rs/esp-wifi#8574d00cab3f88feac9c1afc19932dd02a9d83d6"
 dependencies = [
  "atomic-polyfill 1.0.3",
  "atomic_enum",
@@ -620,7 +620,7 @@ dependencies = [
 [[package]]
 name = "esp-wifi-sys"
 version = "0.1.0"
-source = "git+https://github.com/esp-rs/esp-wifi#69ed0653a5c117d0a1df4bea6ff16f14d483b5c5"
+source = "git+https://github.com/esp-rs/esp-wifi#8574d00cab3f88feac9c1afc19932dd02a9d83d6"
 dependencies = [
  "anyhow",
 ]
@@ -743,6 +743,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "567d3c5f0d708028533811bb255b099aff0a7d61e2ddbf0b44d2485eeb612c99"
 dependencies = [
  "esp-hal-common",
+]
+
+[[package]]
+name = "espilepsy"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec95b71077503dfc5d312f3e5c8eacca0ecf9864a49a5aa4951a5b9f5ff5540a"
+dependencies = [
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-sync 0.4.0",
+ "embassy-time",
+ "esp32c3-hal",
 ]
 
 [[package]]
@@ -1000,9 +1013,9 @@ checksum = "f665ee40bc4a3c5590afb1e9677db74a508659dfd71e126420da8274909a0167"
 
 [[package]]
 name = "minijinja"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f98b09920c8be9ff96a5625aca5b5db7a4f4ba025132ff7d7aacb72c0244a45"
+checksum = "208758577ef2c86cf5dd3e85730d161413ec3284e2d73b2ef65d9a24d9971bcb"
 dependencies = [
  "serde",
 ]
@@ -1408,6 +1421,7 @@ dependencies = [
  "esp-println",
  "esp-wifi",
  "esp32c3-hal",
+ "espilepsy",
  "fixed",
  "smoltcp",
  "static_cell",

@@ -3,7 +3,6 @@
 #![no_main]
 
 use arrayvec::ArrayVec;
-use embassy_executor::_export::StaticCell;
 use embassy_executor::{Executor, Spawner};
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
@@ -12,12 +11,13 @@ use embassy_time::{Duration, Timer};
 use embedded_svc::wifi::{Configuration, Wifi};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_wifi::wifi::{WifiDevice, WifiMode};
+use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
 use esp_wifi::EspWifiInitFor;
 use hal::systimer::SystemTimer;
 use hal::timer::TimerGroup;
 use hal::{clock::ClockControl, peripherals::Peripherals};
 use hal::{prelude::*, Rng, Rtc};
+use static_cell::StaticCell;
 use temperature_firmware::{singleton, write_measurements, Measurement, Temperature, Voltage};
 
 const SSID: &str = env!("SSID");
@@ -44,15 +44,11 @@ fn main() -> ! {
 #[embassy_executor::task]
 async fn embassy_main(spawner: Spawner) {
     let peripherals = Peripherals::take();
-    let mut system = peripherals.SYSTEM.split();
+    let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::max(system.clock_control).freeze();
     let rtc = Rtc::new(peripherals.RTC_CNTL);
 
-    let timer_group0 = TimerGroup::new(
-        peripherals.TIMG0,
-        &clocks,
-        &mut system.peripheral_clock_control,
-    );
+    let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
     hal::embassy::init(&clocks, timer_group0.timer0);
 
     let timer = SystemTimer::new(peripherals.SYSTIMER).alarm0;
@@ -65,14 +61,14 @@ async fn embassy_main(spawner: Spawner) {
     )
     .unwrap();
 
-    let wifi = peripherals.RADIO.split().0;
+    let wifi = peripherals.WIFI;
     let (wifi_interface, mut controller) =
-        esp_wifi::wifi::new_with_mode(&init, wifi, WifiMode::Sta).unwrap();
+        esp_wifi::wifi::new_with_mode(&init, wifi, WifiStaDevice).unwrap();
     let stack_resources = singleton!(StackResources::new(), StackResources::<3>);
     let dhcp_config = embassy_net::Config::dhcpv4(Default::default());
     let stack = singleton!(
         Stack::new(wifi_interface, dhcp_config, stack_resources, 1234,),
-        Stack<WifiDevice<'static>>
+        Stack<WifiDevice<'static, WifiStaDevice>>
     );
 
     spawner.must_spawn(net_task(stack));
@@ -148,6 +144,6 @@ async fn embassy_main(spawner: Spawner) {
 }
 
 #[embassy_executor::task]
-async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
+async fn net_task(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
     stack.run().await
 }

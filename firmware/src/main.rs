@@ -4,29 +4,37 @@
 
 use arrayvec::ArrayVec;
 use embassy_executor::Spawner;
-use embassy_net::dns::DnsQueryType;
-use embassy_net::tcp::TcpSocket;
-use embassy_net::{Stack, StackResources};
-use embassy_sync::channel;
+use embassy_net::{dns::DnsQueryType, tcp::TcpSocket, Stack, StackResources};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    channel::{Channel, Receiver, Sender},
+};
 use embassy_time::{Duration, Timer};
-use embedded_hal_async::spi::SpiBus;
 use embedded_svc::wifi::{Configuration, Wifi};
 use esp_backtrace as _;
+use esp_hal_common::{
+    peripherals::RMT,
+    rmt::{Channel0, TxChannelConfig, TxChannelCreator},
+    Rmt,
+};
 use esp_println::println;
-use esp_wifi::wifi::{WifiController, WifiDevice, WifiError, WifiStaDevice};
-use esp_wifi::EspWifiInitFor;
+use esp_wifi::{
+    wifi::{WifiController, WifiDevice, WifiError, WifiStaDevice},
+    EspWifiInitFor,
+};
+use espilepsy::Color;
 use fixed::types::I20F12;
-use hal::adc::Attenuation;
-use hal::clock::{Clocks, CpuClock};
-use hal::dma::DmaPriority;
-use hal::gdma::{self, Gdma};
-use hal::gpio::{GpioPin, Unknown};
-use hal::rtc_cntl::sleep::TimerWakeupSource;
-use hal::spi::master::dma::WithDmaSpi2;
-use hal::spi::{FullDuplexMode, SpiMode};
-use hal::systimer::SystemTimer;
-use hal::{clock::ClockControl, peripherals::Peripherals, timer::TimerGroup, Rtc};
-use hal::{prelude::*, Rng, IO};
+use hal::{
+    adc::Attenuation,
+    clock::{ClockControl, Clocks, CpuClock},
+    gpio::{GpioPin, Unknown},
+    peripherals::Peripherals,
+    prelude::*,
+    rtc_cntl::sleep::TimerWakeupSource,
+    systimer::SystemTimer,
+    timer::TimerGroup,
+    Rng, Rtc, IO,
+};
 use static_cell::StaticCell;
 
 use temperature_firmware::{
@@ -37,14 +45,7 @@ const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const SENSOR_ID: &str = env!("SENSOR_ID");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
-const MS_PER_MEASUREMENT: u64 = 15_000;
-
-type Channel<T> =
-    channel::Channel<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
-type Receiver<T> =
-    channel::Receiver<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
-type Sender<T> =
-    channel::Sender<'static, embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, T, 2>;
+const MS_PER_MEASUREMENT: u64 = 10_000;
 
 type MeasurementBuffer = ArrayVec<Measurement, 64>;
 
@@ -70,62 +71,6 @@ fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
     unsafe { &mut MEASUREMENT_BUFFER }
 }
 
-struct Led {
-    spi: hal::spi::master::dma::SpiDma<
-        'static,
-        hal::peripherals::SPI2,
-        gdma::Channel0,
-        FullDuplexMode,
-    >,
-    buf: [u8; 48],
-}
-
-impl Led {
-    fn new(
-        dma: hal::peripherals::DMA,
-        spi: hal::peripherals::SPI2,
-        pin: GpioPin<Unknown, 7>,
-        clocks: &Clocks,
-    ) -> Self {
-        let descriptors = singleton!([0u32; 8 * 3], [u32; 8 * 3]);
-        hal::interrupt::enable(
-            hal::peripherals::Interrupt::DMA_CH0,
-            hal::interrupt::Priority::Priority1,
-        )
-        .unwrap();
-
-        let dma = Gdma::new(dma);
-        let dma_channel =
-            dma.channel0
-                .configure(false, descriptors, &mut [], DmaPriority::Priority0);
-
-        let spi =
-            hal::spi::master::Spi::new_mosi_only(spi, pin, 3333u32.kHz(), SpiMode::Mode0, clocks)
-                .with_dma(dma_channel);
-        Self { spi, buf: [0; 48] }
-    }
-
-    async fn color(&mut self, r: u8, g: u8, b: u8) {
-        self.write_color(r, g, b);
-        let _ = SpiBus::write(&mut self.spi, &self.buf).await;
-    }
-
-    fn write_color(&mut self, r: u8, g: u8, b: u8) {
-        Self::write_byte(&mut self.buf[0..4], g);
-        Self::write_byte(&mut self.buf[4..8], r);
-        Self::write_byte(&mut self.buf[8..12], b);
-    }
-
-    fn write_byte(buf: &mut [u8], mut b: u8) {
-        let patterns = [0b1000_1000, 0b1000_1110, 0b1110_1000, 0b1110_1110];
-        for out in buf {
-            let bits = (b & 0b1100_0000) >> 6;
-            *out = patterns[bits as usize];
-            b <<= 2;
-        }
-    }
-}
-
 #[main]
 async fn main(spawner: Spawner) -> ! {
     let measurements = get_measurement_buffer();
@@ -134,7 +79,7 @@ async fn main(spawner: Spawner) -> ! {
     if measurements.is_full() {
         transmit(spawner, measurements).await;
     } else {
-        measure(measurements).await;
+        measure(spawner, measurements).await;
     }
 
     // The unreachable!() shuts up a rust-analyzer warning (because ra doesn't
@@ -149,7 +94,7 @@ async fn main(spawner: Spawner) -> ! {
 async fn connect(
     mut controller: WifiController<'static>,
     stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>,
-    led: Sender<LedState>,
+    led: BlinkySender<'static>,
 ) -> Result<(), WifiError> {
     let client_config = Configuration::Client(embedded_svc::wifi::ClientConfiguration {
         ssid: SSID.into(),
@@ -158,27 +103,37 @@ async fn connect(
     });
     controller.set_configuration(&client_config)?;
     println!("Starting controller...");
-    led.send(LedState::Other).await;
+    led.send(espilepsy::Cmd::Steady(RED)).await;
     // TODO: add a timeout
     controller.start().await?;
 
-    led.send(LedState::WaitingForNetwork).await;
+    led.send(espilepsy::Cmd::Blinky {
+        color0: RED,
+        color1: BLUE,
+        period: Duration::from_millis(500),
+    })
+    .await;
+
     println!("Connecting...");
     // TODO: add a timeout
     controller.connect().await?;
 
-    led.send(LedState::Other).await;
+    led.send(espilepsy::Cmd::Blinky {
+        color0: BLUE,
+        color1: GREEN,
+        period: Duration::from_millis(500),
+    })
+    .await;
     println!("Waiting to get IP address...");
     for _ in 0..40 {
         if let Some(config) = stack.config_v4() {
             println!("Got IP: {}", config.address);
+            led.send(espilepsy::Cmd::Steady(GREEN)).await;
             return Ok(());
         }
-        led.send(LedState::WaitingForNetwork).await;
-        Timer::after(Duration::from_millis(250)).await;
-        led.send(LedState::Other).await;
-        Timer::after(Duration::from_millis(250)).await;
+        Timer::after(Duration::from_millis(500)).await;
     }
+    led.send(espilepsy::Cmd::Steady(OFF)).await;
 
     // TODO: better error
     Err(WifiError::Disconnected)
@@ -260,6 +215,41 @@ async fn send_measurements(
     Ok(())
 }
 
+fn init_led(
+    rmt: RMT,
+    pin: GpioPin<Unknown, 7>,
+    clocks: &Clocks,
+) -> (Channel0<0>, &'static mut BlinkyChannel) {
+    let rmt = Rmt::new(rmt, 80u32.MHz(), &clocks).unwrap();
+    let rmt_channel = rmt
+        .channel0
+        .configure(
+            pin.into_push_pull_output(),
+            TxChannelConfig {
+                clk_divider: 1,
+                ..TxChannelConfig::default()
+            },
+        )
+        .unwrap();
+    let led_channel = singleton!(Channel::new(), BlinkyChannel);
+    (rmt_channel, led_channel)
+}
+
+type BlinkyChannel = Channel<CriticalSectionRawMutex, espilepsy::Cmd, 2>;
+type BlinkyReceiver<'a> = Receiver<'a, CriticalSectionRawMutex, espilepsy::Cmd, 2>;
+type BlinkySender<'a> = Sender<'a, CriticalSectionRawMutex, espilepsy::Cmd, 2>;
+
+const WHITE: Color = Color { r: 5, g: 5, b: 5 };
+const OFF: Color = Color { r: 0, g: 0, b: 0 };
+const RED: Color = Color { r: 16, g: 0, b: 0 };
+const GREEN: Color = Color { r: 0, g: 16, b: 0 };
+const BLUE: Color = Color { r: 0, g: 0, b: 16 };
+
+#[embassy_executor::task]
+async fn led(rmt_channel: Channel0<0>, recv: BlinkyReceiver<'static>) {
+    espilepsy::task(rmt_channel, recv).await
+}
+
 async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer) {
     let peripherals = Peripherals::take();
     let system = peripherals.SYSTEM.split();
@@ -271,9 +261,8 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
     hal::embassy::init(&clocks, timer_group0.timer0);
 
-    let led = Led::new(peripherals.DMA, peripherals.SPI2, io.pins.gpio7, &clocks);
-
-    let led_channel = singleton!(Channel::new(), Channel<LedState>);
+    let (rmt_channel, led_channel) = init_led(peripherals.RMT, io.pins.gpio7, &clocks);
+    spawner.must_spawn(led(rmt_channel, led_channel.receiver()));
 
     let timer = SystemTimer::new(peripherals.SYSTIMER).alarm0;
     let init = esp_wifi::initialize(
@@ -296,21 +285,25 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     );
 
     spawner.must_spawn(temperature_firmware::net_task(stack));
-    spawner.must_spawn(led_task(led, led_channel.receiver()));
-    led_channel.send(LedState::WaitingForNetwork).await;
 
     if connect(controller, stack, led_channel.sender())
         .await
         .is_err()
     {
-        led_channel.send(LedState::Idle).await;
+        led_channel.send(espilepsy::Cmd::Steady(OFF)).await;
         Timer::after(Duration::from_millis(100)).await;
         let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(100));
         let mut delay = hal::Delay::new(&clocks);
         rtc.sleep_deep(&[&mut wake], &mut delay);
     }
 
-    led_channel.send(LedState::Sending).await;
+    led_channel
+        .send(espilepsy::Cmd::Blinky {
+            color0: GREEN,
+            color1: OFF,
+            period: Duration::from_millis(500),
+        })
+        .await;
 
     let result = send_measurements(stack, &rtc, &*measurements).await;
     if result.is_ok() {
@@ -324,7 +317,7 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
         });
     }
 
-    led_channel.send(LedState::Idle).await;
+    led_channel.send(espilepsy::Cmd::Steady(OFF)).await;
     Timer::after(Duration::from_millis(100)).await;
     let rtc_now = rtc.get_time_ms();
     let wakeup_time = rtc_now + MS_PER_MEASUREMENT;
@@ -336,7 +329,7 @@ async fn transmit(spawner: Spawner, measurements: &'static mut MeasurementBuffer
     rtc.sleep_deep(&[&mut wake], &mut delay);
 }
 
-async fn measure(measurements: &'static mut MeasurementBuffer) {
+async fn measure(spawner: Spawner, measurements: &'static mut MeasurementBuffer) {
     let peripherals = Peripherals::take();
     let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::configure(system.clock_control, CpuClock::Clock80MHz).freeze();
@@ -362,8 +355,10 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
 
     hal::embassy::init(&clocks, timer_group0.timer0);
 
-    let mut led = Led::new(peripherals.DMA, peripherals.SPI2, io.pins.gpio7, &clocks);
-    led.color(1, 1, 1).await;
+    let (rmt_channel, led_channel) = init_led(peripherals.RMT, io.pins.gpio7, &clocks);
+    spawner.must_spawn(led(rmt_channel, led_channel.receiver()));
+
+    led_channel.send(espilepsy::Cmd::Steady(WHITE)).await;
 
     #[cfg(feature = "battery")]
     let battery = Some(battery_sensor.read_voltage(&mut adc).await * 4);
@@ -379,7 +374,7 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
         temperature,
     });
 
-    led.color(0, 0, 0).await;
+    led_channel.send(espilepsy::Cmd::Steady(OFF)).await;
     let sleep_ms = if measurements.is_full() {
         0
     } else {
@@ -403,26 +398,4 @@ async fn measure(measurements: &'static mut MeasurementBuffer) {
     let mut delay = hal::Delay::new(&clocks);
     let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(sleep_ms));
     rtc.sleep_deep(&[&mut wake], &mut delay);
-}
-
-enum LedState {
-    WaitingForNetwork,
-    Idle,
-    Sending,
-    Other,
-}
-
-#[embassy_executor::task]
-async fn led_task(mut led: Led, state: Receiver<LedState>) {
-    led.color(0, 0, 0).await;
-    loop {
-        let state = state.receive().await;
-
-        match state {
-            LedState::WaitingForNetwork => led.color(8, 0, 0).await,
-            LedState::Idle => led.color(0, 0, 0).await,
-            LedState::Sending => led.color(0, 0, 2).await,
-            LedState::Other => led.color(0, 1, 2).await,
-        }
-    }
 }
