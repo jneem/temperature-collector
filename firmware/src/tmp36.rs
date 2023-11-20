@@ -57,7 +57,7 @@ pub async fn measure<const BUF_SIZE: usize>(
     let battery = None;
 
     let temperature =
-        Temperature::from_tmp36_voltage(temperature_sensor.read_voltage(&mut adc).await);
+        Temperature::from_tmp36_voltage(temperature_sensor.read_voltage_averaged(&mut adc).await);
     let rtc_ms = rtc.get_time_ms();
     measurements.push(Measurement {
         rtc_ms,

@@ -65,7 +65,7 @@ where
         &mut self,
         reader: &mut Reader,
     ) -> Voltage {
-        const REPS: i32 = 16;
+        const REPS: i32 = 8;
 
         let mut ret = Voltage::ZERO;
         let _ = self.activate_pin.set_high();

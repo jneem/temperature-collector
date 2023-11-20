@@ -16,9 +16,42 @@ const INFLUX_TOKEN: &str = env!("INFLUX_TOKEN");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 
 pub mod analog;
-pub mod status_led;
 pub mod tmp36;
 pub mod transmit;
+
+#[cfg(feature = "status-led")]
+pub mod status_led;
+
+#[cfg(not(feature = "status-led"))]
+pub mod status_led {
+    use embassy_executor::Spawner;
+    use esp_hal_common::{
+        clock::Clocks,
+        gpio::{GpioPin, Unknown},
+        peripherals::RMT,
+    };
+    use espilepsy::Color;
+
+    pub const WHITE: Color = Color { r: 5, g: 5, b: 5 };
+    pub const OFF: Color = Color { r: 0, g: 0, b: 0 };
+    pub const RED: Color = Color { r: 16, g: 0, b: 0 };
+    pub const GREEN: Color = Color { r: 0, g: 16, b: 0 };
+    pub const BLUE: Color = Color { r: 0, g: 0, b: 16 };
+    pub struct LedHandle {}
+
+    impl LedHandle {
+        pub async fn set(&self, _cmd: espilepsy::Cmd) {}
+    }
+
+    pub fn init(
+        _spawner: &Spawner,
+        _rmt: RMT,
+        _pin: GpioPin<Unknown, 7>,
+        _clocks: &Clocks,
+    ) -> LedHandle {
+        LedHandle {}
+    }
+}
 
 #[derive(Copy, Clone)]
 pub struct Voltage {

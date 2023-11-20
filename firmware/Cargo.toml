@@ -7,7 +7,8 @@ license = "MIT OR Apache-2.0"
 
 [features]
 battery = []
-default = ["battery"]
+status-led = []
+default = []
 
 [dependencies]
 hal = { package = "esp32c3-hal", version = "0.13.0", features = ["embassy-time-timg0", "async", "embassy"]}
