@@ -16,6 +16,8 @@ const INFLUX_TOKEN: &str = env!("INFLUX_TOKEN");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 
 pub mod analog;
+pub mod status_led;
+pub mod tmp36;
 
 #[derive(Copy, Clone)]
 pub struct Voltage {
