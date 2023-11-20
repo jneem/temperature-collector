@@ -18,6 +18,7 @@ const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 pub mod analog;
 pub mod status_led;
 pub mod tmp36;
+pub mod transmit;
 
 #[derive(Copy, Clone)]
 pub struct Voltage {
@@ -124,7 +125,7 @@ const MONTH_NAMES: &[&str] = &[
 #[macro_export]
 macro_rules! singleton {
     ($val:expr, $typ:ty) => {{
-        static STATIC_CELL: StaticCell<$typ> = StaticCell::new();
+        static STATIC_CELL: ::static_cell::StaticCell<$typ> = ::static_cell::StaticCell::new();
         STATIC_CELL.init($val)
     }};
 }

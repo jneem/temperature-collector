@@ -12,7 +12,6 @@ use esp_hal_common::{
 };
 use espilepsy::Color;
 use hal::prelude::*;
-use static_cell::StaticCell;
 
 use crate::singleton;
 
