@@ -16,6 +16,7 @@ const INFLUX_TOKEN: &str = env!("INFLUX_TOKEN");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 
 pub mod analog;
+pub mod ds18b20;
 pub mod tmp36;
 pub mod transmit;
 

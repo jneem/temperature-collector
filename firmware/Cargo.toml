@@ -35,6 +35,8 @@ embedded-io-async = "0.6.0"
 static_cell = "=1.2.0"
 esp-hal-common = "0.13.1"
 espilepsy = "0.1.2"
+ds18b20 = "0.1.1"
+one-wire-bus = "0.1.1"
 #portable-atomic = { version = "1.5.1", features = ["critical-section"] }
 
 [profile.dev]
