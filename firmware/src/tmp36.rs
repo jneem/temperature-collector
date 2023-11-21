@@ -40,7 +40,7 @@ pub async fn measure<const BUF_SIZE: usize>(
     );
     let mut temperature_sensor = builder.add_activated_pin(
         io.pins.gpio4.into_analog(),
-        io.pins.gpio0.into_push_pull_output(),
+        io.pins.gpio5.into_push_pull_output(),
         Attenuation::Attenuation2p5dB,
     );
     let mut adc = builder.build(analog.adc1);
