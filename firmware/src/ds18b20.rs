@@ -74,6 +74,7 @@ pub async fn measure<const BUF_SIZE: usize>(
         rtc_ms,
         battery,
         temperature,
+        humidity: None,
     });
 
     led.set(espilepsy::Cmd::Steady(OFF)).await;

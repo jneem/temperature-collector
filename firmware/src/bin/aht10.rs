@@ -5,9 +5,10 @@
 use embassy_executor::Spawner;
 use embassy_time::Duration;
 use esp_backtrace as _;
+use esp_hal_common::{clock::ClockControl, peripherals::Peripherals, timer::TimerGroup, IO};
 use esp_println::println;
 use hal::prelude::*;
-use temperature_firmware::{ds18b20::measure, transmit::transmit};
+use temperature_firmware::{aht10::Parts, status_led};
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
@@ -16,12 +17,12 @@ const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 const MS_PER_MEASUREMENT: u64 = 10_000;
 
 #[main]
-async fn main(spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) {
     let measurements = temperature_firmware::measurements::get_measurement_buffer();
     println!("buffer has {} measurements", measurements.len());
 
     if measurements.is_full() {
-        transmit(
+        temperature_firmware::transmit::transmit(
             spawner,
             measurements,
             SSID,
@@ -32,19 +33,26 @@ async fn main(spawner: Spawner) -> ! {
         )
         .await;
     } else {
-        measure(
-            spawner,
+        let peripherals = Peripherals::take();
+        let system = peripherals.SYSTEM.split();
+        let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
+
+        hal::embassy::init(&clocks, TimerGroup::new(peripherals.TIMG0, &clocks).timer0);
+
+        let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+        let led = status_led::init(&spawner, peripherals.RMT, io.pins.gpio7, &clocks);
+        temperature_firmware::aht10::measure(
             measurements,
             Duration::from_millis(MS_PER_MEASUREMENT),
+            Parts {
+                clocks,
+                rtc: peripherals.RTC_CNTL,
+                sda: io.pins.gpio1,
+                scl: io.pins.gpio2,
+                i2c: peripherals.I2C0,
+            },
+            led,
         )
         .await;
-    }
-
-    // The unreachable!() shuts up a rust-analyzer warning (because ra doesn't
-    // realize that executor.run diverges), and the `allow` shuts up a rustc warning
-    // (because it does realize the executor.run diverges).
-    #[allow(unreachable_code)]
-    {
-        unreachable!();
     }
 }

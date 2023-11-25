@@ -38,9 +38,18 @@ pub async fn measure<const BUF_SIZE: usize>(
         io.pins.gpio2.into_push_pull_output(),
         Attenuation::Attenuation2p5dB,
     );
+
+    // TODO: Some of the devices are already soldered with pin 0 here. This
+    // makes it configurable, but it doesn't really scale. "if cfg!()" doesn't work
+    // here because the two branches have to return the same type.
+    #[cfg(activate_pin_0)]
+    let activate_pin = io.pins.gpio0;
+    #[cfg(not(activate_pin_0))]
+    let activate_pin = io.pins.gpio5;
+
     let mut temperature_sensor = builder.add_activated_pin(
         io.pins.gpio4.into_analog(),
-        io.pins.gpio5.into_push_pull_output(),
+        activate_pin.into_push_pull_output(),
         Attenuation::Attenuation2p5dB,
     );
     let mut adc = builder.build(analog.adc1);
@@ -63,6 +72,7 @@ pub async fn measure<const BUF_SIZE: usize>(
         rtc_ms,
         battery,
         temperature,
+        humidity: None,
     });
 
     led.set(espilepsy::Cmd::Steady(OFF)).await;

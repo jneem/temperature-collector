@@ -17,7 +17,7 @@ hal = { package = "esp32c3-hal", version = "0.13.0", features = ["embassy-time-t
 critical-section = "1.1.2"
 # 0.3.3 requires portable-atomic
 embassy-executor = { version = "=0.3.2", features = ["executor-thread", "arch-riscv32", "nightly", "integrated-timers"] }
-embassy-time = { version = "0.1.1", features = [] }
+embassy-time = { version = "0.1.1", features = ["nightly", "unstable-traits"] }
 esp-wifi = { git = "https://github.com/esp-rs/esp-wifi", features = ["esp32c3", "wifi", "embedded-svc", "embassy-net"]}
 embedded-svc = { version = "0.26.4", default-features = false }
 embassy-net = { version = "0.2.1", features = ["tcp", "medium-ethernet", "dhcpv4", "nightly", "dns"] }
@@ -37,6 +37,7 @@ esp-hal-common = "0.13.1"
 espilepsy = "0.1.2"
 ds18b20 = "0.1.1"
 one-wire-bus = "0.1.1"
+aht10-async = "0.0.1"
 #portable-atomic = { version = "1.5.1", features = ["critical-section"] }
 
 [profile.dev]

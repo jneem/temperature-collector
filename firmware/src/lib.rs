@@ -5,9 +5,14 @@ use core::fmt::{Display, Write};
 
 use arrayvec::ArrayVec;
 use embassy_net::{tcp::TcpSocket, Stack};
+use embassy_time::Duration;
+use esp_hal_common::{clock::Clocks, rtc_cntl::sleep::TimerWakeupSource};
 use esp_println::println;
 use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
-use fixed::{traits::ToFixed, types::I20F12};
+use fixed::{
+    traits::ToFixed,
+    types::{I20F12, I8F8},
+};
 use hal::Rtc;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime};
 
@@ -15,8 +20,10 @@ use time::{Date, Month, OffsetDateTime, PrimitiveDateTime};
 const INFLUX_TOKEN: &str = env!("INFLUX_TOKEN");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 
+pub mod aht10;
 pub mod analog;
 pub mod ds18b20;
+pub mod measurements;
 pub mod tmp36;
 pub mod transmit;
 
@@ -52,6 +59,26 @@ pub mod status_led {
     ) -> LedHandle {
         LedHandle {}
     }
+}
+
+pub fn sleep<const LEN: usize>(
+    measurements: &ArrayVec<Measurement, LEN>,
+    period: Duration,
+    rtc: &mut Rtc<'_>,
+    clocks: &Clocks<'_>,
+) -> ! {
+    let sleep_ms = if measurements.is_full() {
+        0
+    } else {
+        let rtc_now = rtc.get_time_ms();
+        let wakeup_time = rtc_now + period.as_millis();
+        let quantized_wakeup_time = wakeup_time - wakeup_time % period.as_millis();
+        quantized_wakeup_time.saturating_sub(rtc_now)
+    };
+
+    let mut delay = hal::Delay::new(&clocks);
+    let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(sleep_ms));
+    rtc.sleep_deep(&[&mut wake], &mut delay);
 }
 
 #[derive(Copy, Clone)]
@@ -126,9 +153,27 @@ impl Temperature {
     }
 }
 
+#[derive(Copy, Clone, Default)]
+pub struct Humidity {
+    pub relative: I8F8,
+}
+
+impl Humidity {
+    pub fn from_relative<N: ToFixed>(rel: N) -> Self {
+        Self {
+            relative: rel.to_fixed(),
+        }
+    }
+
+    pub fn relative(&self) -> I8F8 {
+        self.relative
+    }
+}
+
 #[derive(Clone)]
 pub struct Measurement {
     pub temperature: Temperature,
+    pub humidity: Option<Humidity>,
     pub battery: Option<Voltage>,
     pub rtc_ms: u64,
 }
@@ -425,6 +470,7 @@ pub async fn write_measurements(
     let rtc_now = rtc.get_time_ms();
     for Measurement {
         temperature,
+        humidity,
         battery,
         rtc_ms,
     } in measurements
@@ -438,18 +484,20 @@ pub async fn write_measurements(
         let secs_ago = (rtc_now.saturating_sub(*rtc_ms) + 500) / 1000;
         let ts = base_secs - secs_ago as i64;
         let deg = temperature.degrees();
+
+        write!(
+            body,
+            "tempSensors,sensor_id={sensor_id} temperature={deg:.2}"
+        )?;
+        if let Some(hum) = humidity {
+            let hum = hum.relative();
+            write!(body, ",battery={hum:.2}")?;
+        }
         if let Some(batt) = battery {
             let batt = batt.v();
-            writeln!(
-                body,
-                "tempSensors,sensor_id={sensor_id} temperature={deg:.2},battery={batt:.2} {ts}"
-            )?;
-        } else {
-            writeln!(
-                body,
-                "tempSensors,sensor_id={sensor_id} temperature={deg:.2} {ts}"
-            )?;
+            write!(body, ",battery={batt:.2}")?;
         }
+        writeln!(body, " {ts}")?;
         println!("body len {}", body.len());
     }
 
