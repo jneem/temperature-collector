@@ -47,8 +47,8 @@ async fn main(spawner: Spawner) {
             Parts {
                 clocks,
                 rtc: peripherals.RTC_CNTL,
-                sda: io.pins.gpio1,
-                scl: io.pins.gpio2,
+                sda: io.pins.gpio8,
+                scl: io.pins.gpio6,
                 i2c: peripherals.I2C0,
             },
             led,

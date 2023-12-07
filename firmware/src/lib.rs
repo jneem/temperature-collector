@@ -76,7 +76,7 @@ pub fn sleep<const LEN: usize>(
         quantized_wakeup_time.saturating_sub(rtc_now)
     };
 
-    let mut delay = hal::Delay::new(&clocks);
+    let mut delay = hal::Delay::new(clocks);
     let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(sleep_ms));
     rtc.sleep_deep(&[&mut wake], &mut delay);
 }
@@ -491,7 +491,7 @@ pub async fn write_measurements(
         )?;
         if let Some(hum) = humidity {
             let hum = hum.relative();
-            write!(body, ",battery={hum:.2}")?;
+            write!(body, ",humidity={hum:.2}")?;
         }
         if let Some(batt) = battery {
             let batt = batt.v();

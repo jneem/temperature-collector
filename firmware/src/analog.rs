@@ -1,8 +1,8 @@
 use embassy_time::Timer;
+use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::{adc, digital};
 use esp_hal_common::{
     adc::{AdcCalLine, AdcConfig, Attenuation},
-    gpio::{Analog, GpioPin, Output, PushPull},
     peripheral::Peripheral,
 };
 use fixed::types::I20F12;
@@ -93,7 +93,7 @@ pub struct AdcBuilder<ADC> {
     config: AdcConfig<ADC>,
 }
 
-pub type AdcPin<ADC, const P: u8> = hal::adc::AdcPin<GpioPin<Analog, P>, ADC, AdcCalLine<ADC>>;
+pub type AdcPin<ADC, P> = hal::adc::AdcPin<P, ADC, AdcCalLine<ADC>>;
 
 impl<ADC> Default for AdcBuilder<ADC>
 where
@@ -110,26 +110,23 @@ impl<ADC> AdcBuilder<ADC>
 where
     ADC: hal::adc::CalibrationAccess + hal::adc::AdcHasLineCal + hal::adc::AdcCalEfuse,
 {
-    pub fn add_pin<const P: u8>(
-        &mut self,
-        pin: GpioPin<Analog, P>,
-        atten: Attenuation,
-    ) -> AdcPin<ADC, P>
+    pub fn add_pin<P>(&mut self, pin: P, atten: Attenuation) -> AdcPin<ADC, P>
     where
-        GpioPin<Analog, P>: adc::Channel<ADC, ID = u8>,
+        P: adc::Channel<ADC, ID = u8>,
     {
         self.config
             .enable_pin_with_cal::<_, AdcCalLine<ADC>>(pin, atten)
     }
 
-    pub fn add_activated_pin<const SP: u8, const AP: u8>(
+    pub fn add_activated_pin<SP, AP>(
         &mut self,
-        sensor_pin: GpioPin<Analog, SP>,
-        activate_pin: GpioPin<Output<PushPull>, AP>,
+        sensor_pin: SP,
+        activate_pin: AP,
         atten: Attenuation,
-    ) -> ActivatedSensor<ADC, AdcPin<ADC, SP>, GpioPin<Output<PushPull>, AP>>
+    ) -> ActivatedSensor<ADC, AdcPin<ADC, SP>, AP>
     where
-        GpioPin<Analog, SP>: adc::Channel<ADC, ID = u8>,
+        SP: adc::Channel<ADC, ID = u8>,
+        AP: OutputPin,
     {
         let sensor_pin = self.add_pin(sensor_pin, atten);
         ActivatedSensor {

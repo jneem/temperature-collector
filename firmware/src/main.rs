@@ -15,9 +15,9 @@ const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 const SENSOR_ID: &str = env!("SENSOR_ID");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
-const MS_PER_MEASUREMENT: u64 = 10_000;
+const MS_PER_MEASUREMENT: u64 = 15_000;
 
-type MeasurementBuffer = ArrayVec<Measurement, 64>;
+type MeasurementBuffer = ArrayVec<Measurement, 128>;
 
 // Workaround for https://github.com/esp-rs/esp-hal/issues/950
 #[ram(rtc_fast, uninitialized)]
@@ -46,7 +46,7 @@ fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
 }
 
 #[main]
-async fn main(spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) {
     let measurements = get_measurement_buffer();
     println!("buffer has {} measurements", measurements.len());
 
@@ -68,13 +68,5 @@ async fn main(spawner: Spawner) -> ! {
             Duration::from_millis(MS_PER_MEASUREMENT),
         )
         .await;
-    }
-
-    // The unreachable!() shuts up a rust-analyzer warning (because ra doesn't
-    // realize that executor.run diverges), and the `allow` shuts up a rustc warning
-    // (because it does realize the executor.run diverges).
-    #[allow(unreachable_code)]
-    {
-        unreachable!();
     }
 }
