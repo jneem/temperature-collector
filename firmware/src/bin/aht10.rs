@@ -5,9 +5,9 @@
 use embassy_executor::Spawner;
 use embassy_time::Duration;
 use esp_backtrace as _;
-use esp_hal_common::{clock::ClockControl, peripherals::Peripherals, timer::TimerGroup, IO};
 use esp_println::println;
 use hal::prelude::*;
+use hal::{clock::ClockControl, gpio::IO, peripherals::Peripherals, timer::TimerGroup};
 use temperature_firmware::{aht10::Parts, status_led};
 
 const SSID: &str = env!("SSID");
@@ -37,7 +37,7 @@ async fn main(spawner: Spawner) {
         let system = peripherals.SYSTEM.split();
         let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
 
-        hal::embassy::init(&clocks, TimerGroup::new(peripherals.TIMG0, &clocks).timer0);
+        hal::embassy::init(&clocks, TimerGroup::new_async(peripherals.TIMG0, &clocks));
 
         let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
         let led = status_led::init(&spawner, peripherals.RMT, io.pins.gpio7, &clocks);
@@ -46,7 +46,7 @@ async fn main(spawner: Spawner) {
             Duration::from_millis(MS_PER_MEASUREMENT),
             Parts {
                 clocks,
-                rtc: peripherals.RTC_CNTL,
+                rtc: peripherals.LPWR,
                 sda: io.pins.gpio8,
                 scl: io.pins.gpio6,
                 i2c: peripherals.I2C0,

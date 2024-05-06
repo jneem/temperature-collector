@@ -1,18 +1,16 @@
 use aht10_async::AHT10;
 use arrayvec::ArrayVec;
 use embassy_time::{Duration, Timer};
-use esp_hal_common::{
+use esp_println::println;
+use hal::{
     clock::Clocks,
+    gpio::{InputPin, OutputPin},
     i2c::I2C,
     interrupt,
     peripheral::Peripheral,
-    peripherals::{Interrupt, I2C0, RTC_CNTL},
-    Rtc,
-};
-use esp_println::println;
-use hal::{
-    gpio::{InputPin, OutputPin},
+    peripherals::{Interrupt, I2C0, LPWR},
     prelude::*,
+    rtc_cntl::Rtc,
 };
 
 use crate::{
@@ -23,7 +21,7 @@ use crate::{
 
 pub struct Parts<SDA, SDC> {
     pub clocks: Clocks<'static>,
-    pub rtc: RTC_CNTL,
+    pub rtc: LPWR,
     pub sda: SDA,
     pub scl: SDC,
     pub i2c: I2C0,
@@ -38,8 +36,8 @@ pub async fn measure<const BUF_SIZE: usize, SDA, SDC>(
     SDA: Peripheral<P = SDA> + InputPin + OutputPin,
     SDC: Peripheral<P = SDC> + InputPin + OutputPin,
 {
-    let mut rtc = Rtc::new(parts.rtc);
-    let i2c = I2C::new(parts.i2c, parts.sda, parts.scl, 400u32.kHz(), &parts.clocks);
+    let mut rtc = Rtc::new(parts.rtc, None);
+    let i2c = I2C::new_async(parts.i2c, parts.sda, parts.scl, 400u32.kHz(), &parts.clocks);
     interrupt::enable(Interrupt::I2C_EXT0, interrupt::Priority::Priority1).unwrap();
 
     led.set(espilepsy::Cmd::Steady(WHITE)).await;

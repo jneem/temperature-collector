@@ -1,19 +1,20 @@
 use arrayvec::ArrayVec;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
-use embedded_hal::adc;
-use embedded_hal::digital::v2::OutputPin;
-use esp_hal_common::{
-    adc::Attenuation,
-    analog::ADC1,
-    clock::{ClockControl, Clocks, CpuClock},
-    peripherals::{Peripherals, RTC_CNTL},
-    rtc_cntl::sleep::TimerWakeupSource,
-    timer::TimerGroup,
-    Rtc, IO,
-};
+use embedded_hal::digital::OutputPin;
 use esp_println::println;
 use hal::prelude::*;
+use hal::{
+    analog::adc,
+    analog::adc::Attenuation,
+    clock::{ClockControl, Clocks, CpuClock},
+    gpio::IO,
+    peripherals::ADC1,
+    peripherals::{Peripherals, LPWR},
+    rtc_cntl::sleep::TimerWakeupSource,
+    rtc_cntl::Rtc,
+    timer::TimerGroup,
+};
 
 use crate::{
     status_led::{LedHandle, OFF, WHITE},
@@ -22,7 +23,7 @@ use crate::{
 
 pub struct Parts<BA, BR, TA, TR> {
     pub clocks: Clocks<'static>,
-    pub rtc: RTC_CNTL,
+    pub rtc: LPWR,
     pub battery_activate: BA,
     pub battery_read: BR,
     pub temp_activate: TA,
@@ -38,10 +39,10 @@ pub async fn measure_new<const BUF_SIZE: usize, BA, BR, TA, TR>(
 ) where
     BA: OutputPin,
     TA: OutputPin,
-    BR: adc::Channel<ADC1, ID = u8>,
-    TR: adc::Channel<ADC1, ID = u8>,
+    BR: adc::AdcChannel,
+    TR: adc::AdcChannel,
 {
-    let mut rtc = Rtc::new(parts.rtc);
+    let mut rtc = Rtc::new(parts.rtc, None);
     let mut builder = crate::analog::AdcBuilder::default();
     #[cfg(feature = "battery")]
     let mut battery_sensor = builder.add_activated_pin(
@@ -87,10 +88,9 @@ pub async fn measure<const BUF_SIZE: usize>(
     let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::configure(system.clock_control, CpuClock::Clock80MHz).freeze();
 
-    let mut rtc = Rtc::new(peripherals.RTC_CNTL);
-    let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
+    let mut rtc = Rtc::new(peripherals.LPWR, None);
+    let timer_group0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let analog = peripherals.APB_SARADC.split();
 
     let mut builder = crate::analog::AdcBuilder::default();
     #[cfg(feature = "battery")]
@@ -103,9 +103,9 @@ pub async fn measure<const BUF_SIZE: usize>(
     // TODO: Some of the devices are already soldered with pin 0 here. This
     // makes it configurable, but it doesn't really scale. "if cfg!()" doesn't work
     // here because the two branches have to return the same type.
-    #[cfg(activate_pin_0)]
+    #[cfg(feature = "activate-pin-0")]
     let activate_pin = io.pins.gpio0;
-    #[cfg(not(activate_pin_0))]
+    #[cfg(not(feature = "activate-pin-0"))]
     let activate_pin = io.pins.gpio5;
 
     let mut temperature_sensor = builder.add_activated_pin(
@@ -113,9 +113,9 @@ pub async fn measure<const BUF_SIZE: usize>(
         activate_pin.into_push_pull_output(),
         Attenuation::Attenuation2p5dB,
     );
-    let mut adc = builder.build(analog.adc1);
+    let mut adc = builder.build(peripherals.ADC1);
 
-    hal::embassy::init(&clocks, timer_group0.timer0);
+    hal::embassy::init(&clocks, timer_group0);
 
     let led = crate::status_led::init(&spawner, peripherals.RMT, io.pins.gpio7, &clocks);
 
@@ -157,7 +157,7 @@ pub async fn measure<const BUF_SIZE: usize>(
     );
     Timer::after(Duration::from_millis(100)).await;
 
-    let mut delay = hal::Delay::new(&clocks);
+    let mut delay = hal::delay::Delay::new(&clocks);
     let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(sleep_ms));
     rtc.sleep_deep(&[&mut wake], &mut delay);
 }

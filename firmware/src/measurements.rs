@@ -30,5 +30,5 @@ pub fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
         }
     }
 
-    unsafe { &mut MEASUREMENT_BUFFER }
+    unsafe { core::mem::transmute(core::ptr::addr_of_mut!(MEASUREMENT_BUFFER)) }
 }

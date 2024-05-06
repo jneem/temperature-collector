@@ -17,7 +17,7 @@ const SENSOR_ID: &str = env!("SENSOR_ID");
 const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 const MS_PER_MEASUREMENT: u64 = 15_000;
 
-type MeasurementBuffer = ArrayVec<Measurement, 128>;
+type MeasurementBuffer = ArrayVec<Measurement, 256>;
 
 // Workaround for https://github.com/esp-rs/esp-hal/issues/950
 #[ram(rtc_fast, uninitialized)]
@@ -42,7 +42,7 @@ fn get_measurement_buffer() -> &'static mut MeasurementBuffer {
         }
     }
 
-    unsafe { &mut MEASUREMENT_BUFFER }
+    unsafe { &mut *core::ptr::addr_of_mut!(MEASUREMENT_BUFFER) }
 }
 
 #[main]

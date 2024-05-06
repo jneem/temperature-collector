@@ -1,19 +1,17 @@
 use arrayvec::ArrayVec;
 use embassy_executor::Spawner;
-use embassy_net::{tcp::TcpSocket, Stack, StackResources};
+use embassy_net::{dns::DnsQueryType, tcp::TcpSocket, Stack, StackResources};
 use embassy_time::{Duration, Timer};
-use embedded_svc::wifi::{Configuration, Wifi};
-use esp_hal_common::{
-    clock::ClockControl, peripherals::Peripherals, rtc_cntl::sleep::TimerWakeupSource,
-    systimer::SystemTimer, timer::TimerGroup, Rng, Rtc, IO,
-};
 use esp_println::println;
 use esp_wifi::{
-    wifi::{WifiController, WifiDevice, WifiError, WifiStaDevice},
+    wifi::{Configuration, WifiController, WifiDevice, WifiError, WifiStaDevice},
     EspWifiInitFor,
 };
 use hal::prelude::*;
-use smoltcp::wire::DnsQueryType;
+use hal::{
+    clock::ClockControl, gpio::IO, peripherals::Peripherals, rng::Rng,
+    rtc_cntl::sleep::TimerWakeupSource, rtc_cntl::Rtc, systimer::SystemTimer, timer::TimerGroup,
+};
 
 use crate::{
     get_time_from_influx, singleton,
@@ -28,9 +26,9 @@ async fn connect(
     ssid: &str,
     password: &str,
 ) -> Result<(), WifiError> {
-    let client_config = Configuration::Client(embedded_svc::wifi::ClientConfiguration {
-        ssid: ssid.into(),
-        password: password.into(),
+    let client_config = Configuration::Client(esp_wifi::wifi::ClientConfiguration {
+        ssid: ssid.try_into().unwrap(),
+        password: password.try_into().unwrap(),
         ..Default::default()
     });
     controller.set_configuration(&client_config)?;
@@ -71,7 +69,7 @@ async fn connect(
     Err(WifiError::Disconnected)
 }
 
-enum SendMeasurementError {
+pub enum SendMeasurementError {
     Connect(embassy_net::tcp::ConnectError),
     Get(GetTimeError),
     Send(crate::SendMeasurementError),
@@ -159,10 +157,10 @@ pub async fn transmit<const CAP: usize>(
     let clocks = ClockControl::max(system.clock_control).freeze();
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
 
-    let mut rtc = Rtc::new(peripherals.RTC_CNTL);
+    let mut rtc = Rtc::new(peripherals.LPWR, None);
 
-    let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
-    hal::embassy::init(&clocks, timer_group0.timer0);
+    let timer_group0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
+    hal::embassy::init(&clocks, timer_group0);
 
     let led = crate::status_led::init(&spawner, peripherals.RMT, io.pins.gpio7, &clocks);
 
@@ -195,7 +193,7 @@ pub async fn transmit<const CAP: usize>(
         led.set(espilepsy::Cmd::Steady(OFF)).await;
         Timer::after(Duration::from_millis(100)).await;
         let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(100));
-        let mut delay = hal::Delay::new(&clocks);
+        let mut delay = hal::delay::Delay::new(&clocks);
         rtc.sleep_deep(&[&mut wake], &mut delay);
     }
 
@@ -219,6 +217,6 @@ pub async fn transmit<const CAP: usize>(
     let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(
         quantized_wakeup_time.saturating_sub(rtc_now),
     ));
-    let mut delay = hal::Delay::new(&clocks);
+    let mut delay = hal::delay::Delay::new(&clocks);
     rtc.sleep_deep(&[&mut wake], &mut delay);
 }

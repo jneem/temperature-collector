@@ -1,19 +1,35 @@
 use embassy_time::Timer;
-use embedded_hal::digital::v2::OutputPin;
-use embedded_hal::{adc, digital};
-use esp_hal_common::{
-    adc::{AdcCalLine, AdcConfig, Attenuation},
-    peripheral::Peripheral,
-};
+use embedded_hal::digital::{self, OutputPin};
 use fixed::types::I20F12;
+use hal::analog::adc::{
+    self, AdcCalLine, AdcCalScheme, AdcChannel, AdcConfig, Attenuation, CalibrationAccess,
+    RegisterAccess,
+};
+use hal::peripheral::Peripheral;
 use hal::prelude::*;
 
 use crate::Voltage;
 
-async fn read_raw<ADC, Pin: adc::Channel<ADC>, Reader: adc::OneShot<ADC, u16, Pin>>(
-    reader: &mut Reader,
-    pin: &mut Pin,
-) -> u16 {
+pub trait AdcReader<Pin> {
+    type Error;
+
+    fn read(&mut self, pin: &mut Pin) -> nb::Result<u16, Self::Error>;
+}
+
+impl<'d, ADCI, Pin> AdcReader<AdcPin<Pin, ADCI>> for hal::analog::adc::ADC<'d, ADCI>
+where
+    ADCI: RegisterAccess + CalibrationAccess + 'd,
+    AdcCalLine<ADCI>: AdcCalScheme<ADCI>,
+    Pin: AdcChannel,
+{
+    type Error = ();
+
+    fn read(&mut self, pin: &mut AdcPin<Pin, ADCI>) -> nb::Result<u16, ()> {
+        self.read_oneshot(pin)
+    }
+}
+
+async fn read_raw<Pin, Reader: AdcReader<Pin>>(reader: &mut Reader, pin: &mut Pin) -> u16 {
     loop {
         let pin_value: nb::Result<u16, _> = reader.read(pin);
         if let Ok(val) = pin_value {
@@ -27,10 +43,7 @@ async fn read_raw<ADC, Pin: adc::Channel<ADC>, Reader: adc::OneShot<ADC, u16, Pi
 }
 
 // Takes a trimmed mean of 10 measurements, throwing away the two extremes.
-async fn read_trimmed<ADC, Pin: adc::Channel<ADC>, Reader: adc::OneShot<ADC, u16, Pin>>(
-    reader: &mut Reader,
-    pin: &mut Pin,
-) -> Voltage {
+async fn read_trimmed<Pin, Reader: AdcReader<Pin>>(reader: &mut Reader, pin: &mut Pin) -> Voltage {
     let mut total = read_raw(reader, pin).await;
     let mut max = total;
     let mut min = total;
@@ -50,18 +63,16 @@ async fn read_trimmed<ADC, Pin: adc::Channel<ADC>, Reader: adc::OneShot<ADC, u16
     Voltage { mv: avg }
 }
 
-pub struct ActivatedSensor<ADC, SensorPin, ActivatePin> {
-    adc: core::marker::PhantomData<ADC>,
+pub struct ActivatedSensor<SensorPin, ActivatePin> {
     sensor_pin: SensorPin,
     activate_pin: ActivatePin,
 }
 
-impl<ADC, SensorPin, ActivatePin> ActivatedSensor<ADC, SensorPin, ActivatePin>
+impl<SensorPin, ActivatePin> ActivatedSensor<SensorPin, ActivatePin>
 where
-    SensorPin: adc::Channel<ADC>,
-    ActivatePin: digital::v2::OutputPin,
+    ActivatePin: digital::OutputPin,
 {
-    pub async fn read_voltage_averaged<Reader: adc::OneShot<ADC, u16, SensorPin>>(
+    pub async fn read_voltage_averaged<Reader: AdcReader<SensorPin>>(
         &mut self,
         reader: &mut Reader,
     ) -> Voltage {
@@ -78,7 +89,7 @@ where
         ret
     }
 
-    pub async fn read_voltage<Reader: adc::OneShot<ADC, u16, SensorPin>>(
+    pub async fn read_voltage<Reader: AdcReader<SensorPin>>(
         &mut self,
         reader: &mut Reader,
     ) -> Voltage {
@@ -93,11 +104,11 @@ pub struct AdcBuilder<ADC> {
     config: AdcConfig<ADC>,
 }
 
-pub type AdcPin<ADC, P> = hal::adc::AdcPin<P, ADC, AdcCalLine<ADC>>;
+pub type AdcPin<P, ADC> = adc::AdcPin<P, ADC, AdcCalLine<ADC>>;
 
 impl<ADC> Default for AdcBuilder<ADC>
 where
-    ADC: hal::adc::CalibrationAccess + hal::adc::AdcHasLineCal + hal::adc::AdcCalEfuse,
+    ADC: adc::CalibrationAccess + adc::AdcHasLineCal,
 {
     fn default() -> Self {
         Self {
@@ -108,11 +119,12 @@ where
 
 impl<ADC> AdcBuilder<ADC>
 where
-    ADC: hal::adc::CalibrationAccess + hal::adc::AdcHasLineCal + hal::adc::AdcCalEfuse,
+    ADC: adc::CalibrationAccess + adc::AdcHasLineCal,
+    AdcCalLine<ADC>: AdcCalScheme<ADC>,
 {
-    pub fn add_pin<P>(&mut self, pin: P, atten: Attenuation) -> AdcPin<ADC, P>
+    pub fn add_pin<P>(&mut self, pin: P, atten: Attenuation) -> AdcPin<P, ADC>
     where
-        P: adc::Channel<ADC, ID = u8>,
+        P: AdcChannel,
     {
         self.config
             .enable_pin_with_cal::<_, AdcCalLine<ADC>>(pin, atten)
@@ -123,20 +135,19 @@ where
         sensor_pin: SP,
         activate_pin: AP,
         atten: Attenuation,
-    ) -> ActivatedSensor<ADC, AdcPin<ADC, SP>, AP>
+    ) -> ActivatedSensor<AdcPin<SP, ADC>, AP>
     where
-        SP: adc::Channel<ADC, ID = u8>,
+        SP: AdcChannel,
         AP: OutputPin,
     {
         let sensor_pin = self.add_pin(sensor_pin, atten);
         ActivatedSensor {
-            adc: core::marker::PhantomData,
             sensor_pin,
             activate_pin,
         }
     }
 
-    pub fn build(self, adc: impl Peripheral<P = ADC> + 'static) -> hal::adc::ADC<'static, ADC> {
-        hal::adc::ADC::adc(adc, self.config).unwrap()
+    pub fn build(self, adc: impl Peripheral<P = ADC> + 'static) -> adc::ADC<'static, ADC> {
+        adc::ADC::new(adc, self.config)
     }
 }

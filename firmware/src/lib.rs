@@ -6,14 +6,14 @@ use core::fmt::{Display, Write};
 use arrayvec::ArrayVec;
 use embassy_net::{tcp::TcpSocket, Stack};
 use embassy_time::Duration;
-use esp_hal_common::{clock::Clocks, rtc_cntl::sleep::TimerWakeupSource};
 use esp_println::println;
 use esp_wifi::wifi::{WifiDevice, WifiStaDevice};
 use fixed::{
     traits::ToFixed,
     types::{I20F12, I8F8},
 };
-use hal::Rtc;
+use hal::rtc_cntl::Rtc;
+use hal::{clock::Clocks, rtc_cntl::sleep::TimerWakeupSource};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime};
 
 // TODO: pass these as parameters instead of hard-coding them into the lib?
@@ -22,7 +22,7 @@ const INFLUX_SERVER: &str = env!("INFLUX_SERVER");
 
 pub mod aht10;
 pub mod analog;
-pub mod ds18b20;
+//pub mod ds18b20;
 pub mod measurements;
 pub mod tmp36;
 pub mod transmit;
@@ -33,12 +33,12 @@ pub mod status_led;
 #[cfg(not(feature = "status-led"))]
 pub mod status_led {
     use embassy_executor::Spawner;
-    use esp_hal_common::{
+    use espilepsy::Color;
+    use hal::{
         clock::Clocks,
         gpio::{GpioPin, Unknown},
         peripherals::RMT,
     };
-    use espilepsy::Color;
 
     pub const WHITE: Color = Color { r: 5, g: 5, b: 5 };
     pub const OFF: Color = Color { r: 0, g: 0, b: 0 };
@@ -76,7 +76,7 @@ pub fn sleep<const LEN: usize>(
         quantized_wakeup_time.saturating_sub(rtc_now)
     };
 
-    let mut delay = hal::Delay::new(clocks);
+    let mut delay = hal::delay::Delay::new(clocks);
     let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(sleep_ms));
     rtc.sleep_deep(&[&mut wake], &mut delay);
 }

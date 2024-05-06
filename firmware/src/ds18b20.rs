@@ -4,15 +4,16 @@ use arrayvec::ArrayVec;
 use ds18b20::Ds18b20;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
-use esp_hal_common::{
-    clock::{ClockControl, CpuClock},
-    peripherals::Peripherals,
-    rtc_cntl::sleep::TimerWakeupSource,
-    timer::TimerGroup,
-    Rtc, IO,
-};
 use esp_println::println;
 use hal::prelude::*;
+use hal::{
+    clock::{ClockControl, CpuClock},
+    gpio::IO,
+    peripherals::Peripherals,
+    rtc_cntl::sleep::TimerWakeupSource,
+    rtc_cntl::Rtc,
+    timer::TimerGroup,
+};
 use one_wire_bus::OneWire;
 
 use crate::{
@@ -58,7 +59,7 @@ pub async fn measure<const BUF_SIZE: usize>(
     let battery = None;
 
     let mut bus = OneWire::new(io.pins.gpio2.into_open_drain_output()).unwrap();
-    let mut delay = esp_hal_common::Delay::new(&clocks);
+    let mut delay = hal::delay::Delay::new(&clocks);
     if !bus.reset(&mut delay).unwrap() {
         panic!("no device");
     }
@@ -99,7 +100,7 @@ pub async fn measure<const BUF_SIZE: usize>(
     );
     Timer::after(Duration::from_millis(100)).await;
 
-    let mut delay = hal::Delay::new(&clocks);
+    let mut delay = hal::delay::Delay::new(&clocks);
     let mut wake = TimerWakeupSource::new(core::time::Duration::from_millis(sleep_ms));
     rtc.sleep_deep(&[&mut wake], &mut delay);
 }
